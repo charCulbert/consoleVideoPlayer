@@ -84,6 +84,9 @@ private:
     std::list<int> cacheOrder;  // LRU tracking
     mutable std::mutex cacheMutex;
 
+    // FFmpeg decoder mutex (FFmpeg contexts are NOT thread-safe)
+    std::mutex decoderMutex;
+
     // FFmpeg contexts (kept open for on-demand decoding)
     AVFormatContext* formatContext = nullptr;
     AVCodecContext* codecContext = nullptr;

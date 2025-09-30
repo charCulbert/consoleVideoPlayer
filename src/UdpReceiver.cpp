@@ -115,7 +115,10 @@ void UdpReceiver::receiveLoop() {
             }
 
             if (!command.empty() && commandCallback) {
-                DEBUG_PRINT("Received command: " << command);
+                // Only log non-SYNC commands to reduce spam
+                if (command.rfind("SYNC ", 0) != 0) {
+                    DEBUG_PRINT("Received command: " << command);
+                }
                 commandCallback(command);
             }
         } else if (received < 0) {

@@ -161,7 +161,10 @@ VideoPlayer* g_videoPlayer = nullptr;
 void handleCommand(const std::string& command) {
     if (!g_videoPlayer) return;
 
-    DEBUG_PRINT("Handling command: " << command);
+    // Only log non-SYNC commands to reduce spam
+    if (command.rfind("SYNC ", 0) != 0) {
+        DEBUG_PRINT("Handling command: " << command);
+    }
 
     if (command == "PLAY") {
         g_videoPlayer->play();
