@@ -5,9 +5,16 @@
 #include <unistd.h>
 #include <SDL2/SDL.h>
 #include <GL/gl.h>
+#include <GL/glext.h>  // For PBO extensions
 
 #include "VideoPlayer.h"
 #include "UdpReceiver.h"
+
+// PBO function pointers (manually loaded GL extensions)
+PFNGLGENBUFFERSPROC glGenBuffers = nullptr;
+PFNGLDELETEBUFFERSPROC glDeleteBuffers = nullptr;
+PFNGLBINDBUFFERPROC glBindBuffer = nullptr;
+PFNGLBUFFERDATAPROC glBufferData = nullptr;
 
 // Simple JSON parser for config (minimal implementation)
 #include <fstream>
@@ -254,6 +261,21 @@ int main() {
         return 1;
     }
 
+    // Load PBO extension functions manually
+    DEBUG_PRINT("Loading OpenGL PBO extensions...");
+    glGenBuffers = (PFNGLGENBUFFERSPROC)SDL_GL_GetProcAddress("glGenBuffers");
+    glDeleteBuffers = (PFNGLDELETEBUFFERSPROC)SDL_GL_GetProcAddress("glDeleteBuffers");
+    glBindBuffer = (PFNGLBINDBUFFERPROC)SDL_GL_GetProcAddress("glBindBuffer");
+    glBufferData = (PFNGLBUFFERDATAPROC)SDL_GL_GetProcAddress("glBufferData");
+
+    if (!glGenBuffers || !glDeleteBuffers || !glBindBuffer || !glBufferData) {
+        std::cerr << "Failed to load PBO extension functions. PBOs not supported on this system." << std::endl;
+        std::cerr << "Falling back to synchronous texture uploads..." << std::endl;
+        // Continue without PBOs - will use fallback path
+    } else {
+        DEBUG_PRINT("PBO extensions loaded successfully");
+    }
+
     // Enable vsync
     SDL_GL_SetSwapInterval(1);
 
@@ -288,6 +310,28 @@ int main() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Setup PBOs (Pixel Buffer Objects) for async texture uploads (if available)
+    GLuint pbos[2] = {0, 0};
+    size_t pboSize = videoPlayer.getWidth() * videoPlayer.getHeight() * 3; // RGB24
+    int pboIndex = 0;      // Current PBO for uploading
+    bool pbosEnabled = false;
+
+    if (glGenBuffers && glBindBuffer && glBufferData) {
+        glGenBuffers(2, pbos);
+
+        // Initialize both PBOs
+        for (int i = 0; i < 2; i++) {
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[i]);
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, nullptr, GL_STREAM_DRAW);
+        }
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); // Unbind
+
+        pbosEnabled = true;
+        std::cout << "PBO double-buffering enabled (" << (pboSize / 1024.0 / 1024.0) << " MB per buffer)" << std::endl;
+    } else {
+        std::cout << "PBOs not available - using synchronous texture uploads" << std::endl;
+    }
 
     // Setup OpenGL viewport
     glViewport(0, 0, windowWidth, windowHeight);
@@ -347,12 +391,39 @@ int main() {
 
         // Get current frame
         const VideoFrame* frame = videoPlayer.getCurrentFrame();
+        static const VideoFrame* lastFramePtr = nullptr;
+
         if (frame) {
-            // Upload texture
-            glBindTexture(GL_TEXTURE_2D, texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
-                        frame->width, frame->height, 0,
-                        GL_RGB, GL_UNSIGNED_BYTE, frame->data.data());
+            // Only upload when frame changes (optimization for both paths)
+            if (frame != lastFramePtr) {
+                lastFramePtr = frame;
+
+                if (pbosEnabled) {
+                    // PBO double-buffering path: async upload
+                    // Step 1: Bind PBO[pboIndex] and upload new frame data (async DMA starts)
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[pboIndex]);
+                    glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, frame->data.data(), GL_STREAM_DRAW);
+
+                    // Step 2: Bind texture and the OTHER PBO (from previous frame)
+                    glBindTexture(GL_TEXTURE_2D, texture);
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[(pboIndex + 1) % 2]);
+
+                    // Step 3: Update texture from PBO (uses data uploaded in previous iteration)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
+                                frame->width, frame->height, 0,
+                                GL_RGB, GL_UNSIGNED_BYTE, nullptr); // nullptr = use bound PBO
+
+                    // Step 4: Unbind PBO and swap indices for next frame
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                    pboIndex = (pboIndex + 1) % 2;
+                } else {
+                    // Fallback: synchronous upload (old method)
+                    glBindTexture(GL_TEXTURE_2D, texture);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
+                                frame->width, frame->height, 0,
+                                GL_RGB, GL_UNSIGNED_BYTE, frame->data.data());
+                }
+            }
 
             // Clear and render
             glClear(GL_COLOR_BUFFER_BIT);
@@ -394,6 +465,9 @@ int main() {
     // Cleanup
     DEBUG_PRINT("Cleaning up...");
     udpReceiver.stop();
+    if (pbosEnabled && glDeleteBuffers) {
+        glDeleteBuffers(2, pbos);
+    }
     glDeleteTextures(1, &texture);
     SDL_GL_DeleteContext(glContext);
     SDL_DestroyWindow(window);
