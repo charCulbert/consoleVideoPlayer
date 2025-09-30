@@ -1,6 +1,7 @@
 #include "VideoPlayer.h"
 #include <iostream>
 #include <cstring>
+#include <cmath>
 
 #define DEBUG_PRINT(msg) do { \
     std::cout << "[VideoPlayer] " << msg << std::endl; \
@@ -77,6 +78,9 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
         avformat_close_input(&formatContext);
         return false;
     }
+
+	codecContext->thread_count = 0; 
+
 
     if (avcodec_open2(codecContext, codec, nullptr) < 0) {
         errorMessage = "Failed to open codec";
@@ -211,6 +215,27 @@ void VideoPlayer::seek(double seconds) {
     DEBUG_PRINT("Seeked to " << seconds << "s (frame " << currentFrameIndex << ")");
 }
 
+void VideoPlayer::syncToTimestamp(double audioTimestamp) {
+    if (!loaded || frames.empty() || !playing) return;
+
+    // Calculate target frame from audio timestamp
+    // Handle looping: take modulo of video duration
+    double loopedTime = std::fmod(audioTimestamp, duration);
+    if (loopedTime < 0) loopedTime += duration;
+
+    int targetFrame = (int)(loopedTime * fps);
+
+    // Clamp to valid range
+    targetFrame = std::max(0, std::min(targetFrame, (int)frames.size() - 1));
+
+    // Update frame index directly - no accumulation, no drift!
+    currentFrameIndex.store(targetFrame, std::memory_order_relaxed);
+
+    // Mark external sync as active and update timestamp
+    externalSyncActive.store(true, std::memory_order_relaxed);
+    lastSyncTime = std::chrono::steady_clock::now();
+}
+
 const VideoFrame* VideoPlayer::getCurrentFrame() {
     if (!loaded || frames.empty()) return nullptr;
     return &frames[currentFrameIndex];
@@ -219,6 +244,23 @@ const VideoFrame* VideoPlayer::getCurrentFrame() {
 void VideoPlayer::update() {
     if (!playing || !loaded || frames.empty()) return;
 
+    // Check if external sync is active (receiving SYNC messages at 1kHz)
+    if (externalSyncActive.load(std::memory_order_relaxed)) {
+        auto now = std::chrono::steady_clock::now();
+        auto timeSinceLastSync = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyncTime);
+
+        // If we've received SYNC within last 100ms, external clock is driving - do nothing
+        if (timeSinceLastSync.count() < 100) {
+            return; // External sync active - skip internal timer
+        }
+
+        // External sync timed out - fall back to internal timer
+        DEBUG_PRINT("External sync timeout - falling back to internal timer");
+        externalSyncActive.store(false, std::memory_order_relaxed);
+        lastFrameTime = now; // Reset timer
+    }
+
+    // Fallback: timer-based frame advancement (when no external sync)
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastFrameTime);
 

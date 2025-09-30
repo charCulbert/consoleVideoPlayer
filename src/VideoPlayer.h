@@ -34,10 +34,13 @@ public:
     void stop();
     void seek(double seconds);
 
+    // Sync to external audio clock (preferred method - drift-free)
+    void syncToTimestamp(double audioTimestamp);
+
     // Get current frame for rendering
     const VideoFrame* getCurrentFrame();
 
-    // Update playback position (call regularly)
+    // Update playback position (call regularly) - fallback timer-based method
     void update();
 
     // Getters
@@ -65,4 +68,8 @@ private:
     std::atomic<int> currentFrameIndex{0};
     std::chrono::steady_clock::time_point lastFrameTime;
     std::chrono::microseconds frameDuration{0};
+
+    // Sync mode tracking - when receiving external clock sync, disable internal timer
+    std::atomic<bool> externalSyncActive{false};
+    std::chrono::steady_clock::time_point lastSyncTime;
 };

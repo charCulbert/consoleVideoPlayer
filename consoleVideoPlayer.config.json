@@ -1,5 +1,5 @@
 {
-  "videoFilePath": "/home/char/Downloads/test_video.mp4",
+  "videoFilePath": "/home/char/Downloads/video.mp4",
   "udpPort": 8080,
   "fullscreen": false,
   "windowTitle": "Video Player"

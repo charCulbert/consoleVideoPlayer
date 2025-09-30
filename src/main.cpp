@@ -167,6 +167,11 @@ void handleCommand(const std::string& command) {
         std::string posStr = command.substr(5);
         double position = std::stod(posStr);
         g_videoPlayer->seek(position);
+    } else if (command.rfind("SYNC ", 0) == 0) {
+        // Parse "SYNC 1.234" -> sync to audio timestamp (1kHz clock-driven sync)
+        std::string timestampStr = command.substr(5);
+        double audioTimestamp = std::stod(timestampStr);
+        g_videoPlayer->syncToTimestamp(audioTimestamp);
     } else if (command == "LOOP" || command == "HELLO") {
         // Handle loop trigger from audio player - seek to start and play
         DEBUG_PRINT("Loop trigger received - seeking to start");
