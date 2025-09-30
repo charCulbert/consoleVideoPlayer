@@ -1,0 +1,30 @@
+[Unit]
+Description=Console Video Player
+After=network.target sound.target
+
+[Service]
+Type=simple
+User=char
+Group=char
+WorkingDirectory=/home/char/consoleVideoPlayer
+ExecStart=/home/char/consoleVideoPlayer/build/consoleVideoPlayer
+
+# Environment for SDL2 KMS/DRM backend (headless)
+Environment="SDL_VIDEODRIVER=kmsdrm"
+# Alternative if you have X11/Wayland running:
+# Environment="DISPLAY=:0"
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
