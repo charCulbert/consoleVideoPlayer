@@ -9,6 +9,7 @@
 
 #include "VideoPlayer.h"
 #include "UdpReceiver.h"
+#include "JackTransportClient.h"
 
 // PBO function pointers (manually loaded GL extensions)
 PFNGLGENBUFFERSPROC glGenBuffers = nullptr;
@@ -45,21 +46,25 @@ struct Settings {
 };
 
 std::string getConfigFilePath() {
+    const std::string configName = "consoleVideoPlayer.config.json";
+
+    // Priority order: /var/lib/consoleSyncedPlayer/ -> ../ -> ./
+    std::vector<std::string> searchPaths = {
 #ifdef __linux__
-    const std::string configDir = "/var/lib/consoleSyncedPlayer";
-    try {
-        if (!std::filesystem::exists(configDir)) {
-            std::filesystem::create_directories(configDir);
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Warning: Could not create config directory " << configDir
-                  << ", falling back to current directory: " << e.what() << std::endl;
-        return "consoleVideoPlayer.config.json";
-    }
-    return configDir + "/consoleVideoPlayer.config.json";
-#else
-    return "consoleVideoPlayer.config.json";
+        "/var/lib/consoleSyncedPlayer/" + configName,
 #endif
+        "../" + configName,
+        configName
+    };
+
+    for (const auto& path : searchPaths) {
+        if (std::filesystem::exists(path)) {
+            return path;
+        }
+    }
+
+    // If none exist, return the first path (will use defaults)
+    return searchPaths[0];
 }
 
 // Simple JSON parser for our limited needs
@@ -156,41 +161,9 @@ Settings loadSettings() {
 }
 
 // Global video player for UDP callback
-VideoPlayer* g_videoPlayer = nullptr;
-
-void handleCommand(const std::string& command) {
-    if (!g_videoPlayer) return;
-
-    // Only log non-SYNC commands to reduce spam
-    if (command.rfind("SYNC ", 0) != 0) {
-        DEBUG_PRINT("Handling command: " << command);
-    }
-
-    if (command == "PLAY") {
-        g_videoPlayer->play();
-    } else if (command == "PAUSE") {
-        g_videoPlayer->pause();
-    } else if (command == "STOP") {
-        g_videoPlayer->stop();
-    } else if (command.rfind("SEEK ", 0) == 0) {
-        // Parse "SEEK 0" -> seek to position
-        std::string posStr = command.substr(5);
-        double position = std::stod(posStr);
-        g_videoPlayer->seek(position);
-    } else if (command.rfind("SYNC ", 0) == 0) {
-        // Parse "SYNC 1.234" -> sync to audio timestamp (1kHz clock-driven sync)
-        std::string timestampStr = command.substr(5);
-        double audioTimestamp = std::stod(timestampStr);
-        g_videoPlayer->syncToTimestamp(audioTimestamp);
-    } else if (command == "LOOP" || command == "HELLO") {
-        // Handle loop trigger from audio player - seek to start and play
-        DEBUG_PRINT("Loop trigger received - seeking to start");
-        g_videoPlayer->seek(0.0);
-        if (!g_videoPlayer->isPlaying()) {
-            g_videoPlayer->play();
-        }
-    }
-}
+// UDP-based command handling (replaced by JACK Transport)
+// VideoPlayer* g_videoPlayer = nullptr;
+// void handleCommand(const std::string& command) { ... }
 
 int main() {
     // Install signal handlers
@@ -289,7 +262,6 @@ int main() {
     // Load video
     DEBUG_PRINT("Loading video file...");
     VideoPlayer videoPlayer;
-    g_videoPlayer = &videoPlayer;
 
     if (!videoPlayer.loadVideo(settings.videoFilePath)) {
         std::cerr << "Failed to load video: " << videoPlayer.getErrorMessage() << std::endl;
@@ -347,19 +319,25 @@ int main() {
     glEnable(GL_TEXTURE_2D);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
-    // Start UDP receiver
-    DEBUG_PRINT("Starting UDP receiver...");
-    UdpReceiver udpReceiver(settings.udpPort);
-    if (!udpReceiver.start(handleCommand)) {
-        std::cerr << "Failed to start UDP receiver: " << udpReceiver.getErrorMessage() << std::endl;
+    // Initialize JACK Transport client
+    DEBUG_PRINT("Initializing JACK Transport client...");
+    JackTransportClient jackTransport("consoleVideoPlayer");
+    if (!jackTransport.isInitialized()) {
+        std::cerr << "Failed to initialize JACK Transport: " << jackTransport.getErrorMessage() << std::endl;
+        std::cerr << "Make sure JACK server is running (try: jackd -d alsa -r 48000)" << std::endl;
         SDL_GL_DeleteContext(glContext);
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
     }
 
-    std::cout << "\nUDP receiver listening on port " << settings.udpPort << std::endl;
-    std::cout << "Ready for commands: PLAY, PAUSE, STOP, SEEK <seconds>" << std::endl;
+    jack_nframes_t jackSampleRate = jackTransport.getSampleRate();
+    double fps = videoPlayer.getFPS();
+
+    std::cout << "\nJACK Transport initialized" << std::endl;
+    std::cout << "  JACK sample rate: " << jackSampleRate << " Hz" << std::endl;
+    std::cout << "  Video FPS: " << fps << std::endl;
+    std::cout << "Sample-accurate video sync enabled!" << std::endl;
     std::cout << "Press ESC or Q to quit\n" << std::endl;
 
     // Start playing
@@ -391,6 +369,23 @@ int main() {
 
         // Update video player
         videoPlayer.update();
+
+        // Query JACK transport position and sync video to it
+        jack_nframes_t currentJackFrame = jackTransport.getCurrentFrame();
+        double currentSeconds = (double)currentJackFrame / jackSampleRate;
+        int targetVideoFrame = (int)(currentSeconds * fps);
+
+        // Clamp to valid frame range
+        int totalFrames = videoPlayer.getFrameCount();
+        if (targetVideoFrame >= totalFrames) {
+            targetVideoFrame = totalFrames - 1;
+        }
+        if (targetVideoFrame < 0) {
+            targetVideoFrame = 0;
+        }
+
+        // Seek to JACK transport position
+        videoPlayer.seek(currentSeconds);
 
         // Get current frame
         const VideoFrame* frame = videoPlayer.getCurrentFrame();
@@ -467,7 +462,7 @@ int main() {
 
     // Cleanup
     DEBUG_PRINT("Cleaning up...");
-    udpReceiver.stop();
+    // JACK transport client will be automatically cleaned up via RAII
     if (pbosEnabled && glDeleteBuffers) {
         glDeleteBuffers(2, pbos);
     }

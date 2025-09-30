@@ -215,7 +215,7 @@ void VideoPlayer::seek(double seconds) {
     currentFrameIndex = std::max(0, std::min(targetFrame, totalFrames - 1));
     lastFrameTime = std::chrono::steady_clock::now();
 
-    DEBUG_PRINT("Seeked to " << seconds << "s (frame " << currentFrameIndex << ")");
+    // DEBUG_PRINT("Seeked to " << seconds << "s (frame " << currentFrameIndex << ")");
 }
 
 void VideoPlayer::syncToTimestamp(double audioTimestamp) {
