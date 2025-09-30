@@ -125,11 +125,56 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
         return false;
     }
 
-    // Pre-load first 150 frames for instant startup (and seamless looping)
+    // Pre-load first 150 frames sequentially (fast startup + seamless looping)
     DEBUG_PRINT("Pre-loading first 150 frames...");
-    for (int i = 0; i < 150 && i < totalFrames; i++) {
-        decodeFrame(i);
+
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    int numBytes = width * height * 3;
+    int frameCount = 0;
+    int maxPreload = std::min(150, totalFrames);
+
+    // Seek to beginning
+    av_seek_frame(formatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(codecContext);
+
+    // Decode sequentially (no seeking per frame - much faster!)
+    while (av_read_frame(formatContext, packet) >= 0 && frameCount < maxPreload) {
+        if (packet->stream_index == videoStreamIndex) {
+            if (avcodec_send_packet(codecContext, packet) >= 0) {
+                while (avcodec_receive_frame(codecContext, frame) >= 0) {
+                    VideoFrame vf;
+                    vf.width = width;
+                    vf.height = height;
+                    vf.linesize = width * 3;
+                    vf.data.resize(numBytes);
+
+                    uint8_t* dest[1] = { vf.data.data() };
+                    int destLinesize[1] = { vf.linesize };
+
+                    sws_scale(swsContext,
+                             frame->data, frame->linesize, 0, height,
+                             dest, destLinesize);
+
+                    // Add to cache
+                    {
+                        std::lock_guard<std::mutex> lock(cacheMutex);
+                        frameCache[frameCount] = std::move(vf);
+                        cacheOrder.push_back(frameCount);
+                    }
+
+                    frameCount++;
+                    if (frameCount >= maxPreload) break;
+                }
+            }
+        }
+        av_packet_unref(packet);
     }
+
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+
+    DEBUG_PRINT("Pre-loaded " << frameCount << " frames");
 
     // Calculate expected memory usage
     size_t expectedMemory = MAX_CACHED_FRAMES * width * height * 3;
