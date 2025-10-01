@@ -15,6 +15,9 @@ public:
     // Get current transport position in frames
     jack_nframes_t getCurrentFrame();
 
+    // Get JACK transport state (rolling = playing, stopped = paused)
+    bool isTransportRolling();
+
     // Get JACK sample rate
     jack_nframes_t getSampleRate();
 

@@ -56,6 +56,7 @@ public:
     int getWidth() const { return width; }
     int getHeight() const { return height; }
     double getDuration() const { return duration; }
+    int getCurrentFrameIndex() const { return currentFrameIndex.load(std::memory_order_relaxed); }
 
 private:
     bool loaded = false;

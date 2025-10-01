@@ -43,6 +43,7 @@ struct Settings {
     int udpPort = 8080;
     bool fullscreen = true;
     std::string windowTitle = "Video Player";
+    std::string scaleMode = "letterbox";  // Options: "letterbox", "stretch", "crop"
 };
 
 std::string getConfigFilePath() {
@@ -126,14 +127,11 @@ std::map<std::string, std::string> parseSimpleJson(const std::string& content) {
 }
 
 Settings loadSettings() {
-    DEBUG_PRINT("Loading settings...");
     Settings settings;
     const std::string settingsFile = getConfigFilePath();
 
     try {
         if (std::filesystem::exists(settingsFile)) {
-            DEBUG_PRINT("Settings file exists: " << settingsFile);
-
             std::ifstream file(settingsFile);
             std::stringstream buffer;
             buffer << file.rdbuf();
@@ -145,14 +143,11 @@ Settings loadSettings() {
             if (json.count("udpPort")) settings.udpPort = std::stoi(json["udpPort"]);
             if (json.count("fullscreen")) {
                 std::string fullscreenValue = json["fullscreen"];
-                DEBUG_PRINT("Parsed fullscreen value: '" << fullscreenValue << "'");
                 settings.fullscreen = (fullscreenValue == "true");
             }
             if (json.count("windowTitle")) settings.windowTitle = json["windowTitle"];
+            if (json.count("scaleMode")) settings.scaleMode = json["scaleMode"];
 
-            DEBUG_PRINT("Settings loaded successfully");
-        } else {
-            DEBUG_PRINT("Settings file does not exist: " << settingsFile);
         }
     } catch (const std::exception& e) {
         std::cout << "Warning: Could not load settings, using defaults: " << e.what() << std::endl;
@@ -170,18 +165,10 @@ int main() {
     signal(SIGSEGV, signal_handler);
     signal(SIGABRT, signal_handler);
 
-    DEBUG_PRINT("Starting Console Video Player");
-
-    std::cout << "Console Video Player" << std::endl;
-    std::cout << "====================" << std::endl;
+    std::cout << "Console Video Player (JACK Sync)" << std::endl;
+    std::cout << "=================================" << std::endl;
 
     auto settings = loadSettings();
-
-    std::cout << "\nLoaded settings:" << std::endl;
-    std::cout << "  Video file: " << settings.videoFilePath << std::endl;
-    std::cout << "  UDP port: " << settings.udpPort << std::endl;
-    std::cout << "  Fullscreen: " << (settings.fullscreen ? "yes" : "no") << std::endl;
-    std::cout << "  Window title: " << settings.windowTitle << std::endl;
 
     // Check if video file exists
     if (!std::filesystem::exists(settings.videoFilePath)) {
@@ -190,7 +177,6 @@ int main() {
     }
 
     // Initialize SDL
-    DEBUG_PRINT("Initializing SDL...");
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "SDL initialization failed: " << SDL_GetError() << std::endl;
         return 1;
@@ -202,15 +188,22 @@ int main() {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     // Create window
-    DEBUG_PRINT("Creating SDL window...");
     Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
     int windowWidth = 1280;
     int windowHeight = 720;
 
     if (settings.fullscreen) {
         windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
-        windowWidth = 1920;
-        windowHeight = 1080;
+        // Query actual display size
+        SDL_DisplayMode dm;
+        if (SDL_GetDesktopDisplayMode(0, &dm) == 0) {
+            windowWidth = dm.w;
+            windowHeight = dm.h;
+            std::cout << "Fullscreen: " << windowWidth << "x" << windowHeight << std::endl;
+        } else {
+            windowWidth = 1920;
+            windowHeight = 1080;
+        }
     }
 
     SDL_Window* window = SDL_CreateWindow(
@@ -228,7 +221,6 @@ int main() {
     }
 
     // Create OpenGL context
-    DEBUG_PRINT("Creating OpenGL context...");
     SDL_GLContext glContext = SDL_GL_CreateContext(window);
     if (!glContext) {
         std::cerr << "OpenGL context creation failed: " << SDL_GetError() << std::endl;
@@ -238,18 +230,14 @@ int main() {
     }
 
     // Load PBO extension functions manually
-    DEBUG_PRINT("Loading OpenGL PBO extensions...");
     glGenBuffers = (PFNGLGENBUFFERSPROC)SDL_GL_GetProcAddress("glGenBuffers");
     glDeleteBuffers = (PFNGLDELETEBUFFERSPROC)SDL_GL_GetProcAddress("glDeleteBuffers");
     glBindBuffer = (PFNGLBINDBUFFERPROC)SDL_GL_GetProcAddress("glBindBuffer");
     glBufferData = (PFNGLBUFFERDATAPROC)SDL_GL_GetProcAddress("glBufferData");
 
     if (!glGenBuffers || !glDeleteBuffers || !glBindBuffer || !glBufferData) {
-        std::cerr << "Failed to load PBO extension functions. PBOs not supported on this system." << std::endl;
-        std::cerr << "Falling back to synchronous texture uploads..." << std::endl;
+        std::cout << "⚠ PBOs not supported - using synchronous texture uploads" << std::endl;
         // Continue without PBOs - will use fallback path
-    } else {
-        DEBUG_PRINT("PBO extensions loaded successfully");
     }
 
     // Enable vsync
@@ -257,10 +245,8 @@ int main() {
 
     // Get actual window size
     SDL_GetWindowSize(window, &windowWidth, &windowHeight);
-    std::cout << "  Window size: " << windowWidth << "x" << windowHeight << std::endl;
 
     // Load video
-    DEBUG_PRINT("Loading video file...");
     VideoPlayer videoPlayer;
 
     if (!videoPlayer.loadVideo(settings.videoFilePath)) {
@@ -271,11 +257,8 @@ int main() {
         return 1;
     }
 
-    std::cout << "\nVideo loaded:" << std::endl;
-    std::cout << "  Resolution: " << videoPlayer.getWidth() << "x" << videoPlayer.getHeight() << std::endl;
-    std::cout << "  FPS: " << videoPlayer.getFPS() << std::endl;
-    std::cout << "  Frames: " << videoPlayer.getFrameCount() << std::endl;
-    std::cout << "  Duration: " << videoPlayer.getDuration() << "s" << std::endl;
+    std::cout << "Video: " << videoPlayer.getWidth() << "x" << videoPlayer.getHeight()
+              << " @ " << videoPlayer.getFPS() << " fps (" << videoPlayer.getDuration() << "s)" << std::endl;
 
     // Setup OpenGL texture
     GLuint texture;
@@ -303,9 +286,7 @@ int main() {
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); // Unbind
 
         pbosEnabled = true;
-        std::cout << "PBO double-buffering enabled (" << (pboSize / 1024.0 / 1024.0) << " MB per buffer)" << std::endl;
-    } else {
-        std::cout << "PBOs not available - using synchronous texture uploads" << std::endl;
+        std::cout << "✓ PBO double-buffering enabled" << std::endl;
     }
 
     // Setup OpenGL viewport
@@ -320,7 +301,6 @@ int main() {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
     // Initialize JACK Transport client
-    DEBUG_PRINT("Initializing JACK Transport client...");
     JackTransportClient jackTransport("consoleVideoPlayer");
     if (!jackTransport.isInitialized()) {
         std::cerr << "Failed to initialize JACK Transport: " << jackTransport.getErrorMessage() << std::endl;
@@ -334,11 +314,8 @@ int main() {
     jack_nframes_t jackSampleRate = jackTransport.getSampleRate();
     double fps = videoPlayer.getFPS();
 
-    std::cout << "\nJACK Transport initialized" << std::endl;
-    std::cout << "  JACK sample rate: " << jackSampleRate << " Hz" << std::endl;
-    std::cout << "  Video FPS: " << fps << std::endl;
-    std::cout << "Sample-accurate video sync enabled!" << std::endl;
-    std::cout << "Press ESC or Q to quit\n" << std::endl;
+    std::cout << "✓ JACK Transport synced (" << jackSampleRate << " Hz)" << std::endl;
+    std::cout << "\nReady. Press ESC or Q to quit.\n" << std::endl;
 
     // Start playing
     videoPlayer.play();
@@ -370,6 +347,30 @@ int main() {
         // Update video player
         videoPlayer.update();
 
+        // Sync video play/pause state to JACK Transport
+        bool jackIsPlaying = jackTransport.isTransportRolling();
+        static bool lastJackState = jackIsPlaying;
+        static int pboWarmupFramesRemaining = 0;  // Force sync upload for 2 frames to flush both PBOs
+
+        if (jackIsPlaying && !videoPlayer.isPlaying()) {
+            DEBUG_PRINT("JACK started - playing video");
+            videoPlayer.play();
+            pboWarmupFramesRemaining = 2;  // Flush both PBO buffers with sync uploads
+            // Reset PBO index to ensure clean state after warmup
+            if (pbosEnabled) {
+                pboIndex = 0;
+                DEBUG_PRINT("PBO index reset for warmup");
+            }
+        } else if (!jackIsPlaying && videoPlayer.isPlaying()) {
+            DEBUG_PRINT("JACK stopped - pausing video");
+            videoPlayer.pause();
+        }
+
+        if (lastJackState != jackIsPlaying) {
+            DEBUG_PRINT("JACK state changed: " << (jackIsPlaying ? "PLAYING" : "STOPPED"));
+            lastJackState = jackIsPlaying;
+        }
+
         // Query JACK transport position and sync video to it
         jack_nframes_t currentJackFrame = jackTransport.getCurrentFrame();
         double currentSeconds = (double)currentJackFrame / jackSampleRate;
@@ -384,65 +385,131 @@ int main() {
             targetVideoFrame = 0;
         }
 
-        // Seek to JACK transport position
+        // Always seek to JACK transport position (works even when paused)
         videoPlayer.seek(currentSeconds);
 
         // Get current frame
         const VideoFrame* frame = videoPlayer.getCurrentFrame();
-        static const VideoFrame* lastFramePtr = nullptr;
+        static int lastUploadedFrameIndex = -1;
+        static int lastTargetVideoFrame = -1;
+
+        // Track actual frame index being displayed (from video player's currentFrameIndex)
+        int actualFrameIndex = videoPlayer.getCurrentFrameIndex();
 
         if (frame) {
-            // Only upload when frame changes (optimization for both paths)
-            if (frame != lastFramePtr) {
-                lastFramePtr = frame;
-
+            // Detect seeks: if target frame jumped by more than 5 frames, force PBO warmup
+            // This flushes stale PBO buffers and ensures correct frame displays immediately
+            if (lastTargetVideoFrame != -1 && std::abs(targetVideoFrame - lastTargetVideoFrame) > 5) {
+                pboWarmupFramesRemaining = 2;  // Flush both PBO buffers
+                // Reset PBO index to ensure clean state after warmup
                 if (pbosEnabled) {
-                    // PBO double-buffering path: async upload
-                    // Step 1: Bind PBO[pboIndex] and upload new frame data (async DMA starts)
+                    pboIndex = 0;
+                }
+                DEBUG_PRINT("Seek detected: " << lastTargetVideoFrame << " -> " << targetVideoFrame << " (forcing 2-frame PBO flush)");
+            }
+            lastTargetVideoFrame = targetVideoFrame;
+
+            // Debug: Print frame info on every frame when we're around position 0 (or during seeks)
+            if (targetVideoFrame < 10 || pboWarmupFramesRemaining > 0) {
+                DEBUG_PRINT(">>> RENDERING: Target=" << targetVideoFrame
+                          << " Actual=" << actualFrameIndex
+                          << " JACK=" << currentJackFrame
+                          << " Warmup=" << pboWarmupFramesRemaining
+                          << " Playing=" << (videoPlayer.isPlaying() ? "YES" : "NO"));
+            }
+
+            // Upload when target frame index changes (not just pointer)
+            // This ensures texture updates even when getCurrentFrame() returns same cached frame during seeks
+            if (targetVideoFrame != lastUploadedFrameIndex) {
+                lastUploadedFrameIndex = targetVideoFrame;
+
+                // Use PBOs only when playing (1-frame delay is acceptable during motion)
+                // When paused or warming up PBOs, use synchronous upload for immediate visual feedback
+                if (pbosEnabled && videoPlayer.isPlaying() && pboWarmupFramesRemaining == 0) {
+                    // PBO double-buffering path: async upload (1-frame delay)
                     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[pboIndex]);
                     glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, frame->data.data(), GL_STREAM_DRAW);
 
-                    // Step 2: Bind texture and the OTHER PBO (from previous frame)
                     glBindTexture(GL_TEXTURE_2D, texture);
                     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[(pboIndex + 1) % 2]);
 
-                    // Step 3: Update texture from PBO (uses data uploaded in previous iteration)
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
                                 frame->width, frame->height, 0,
                                 GL_RGB, GL_UNSIGNED_BYTE, nullptr); // nullptr = use bound PBO
 
-                    // Step 4: Unbind PBO and swap indices for next frame
                     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                     pboIndex = (pboIndex + 1) % 2;
+                    DEBUG_PRINT("Frame " << targetVideoFrame << ": PBO upload (1-frame delay)");
                 } else {
-                    // Fallback: synchronous upload (old method)
+                    // Paused, warming up, or PBOs unavailable: synchronous upload (immediate, no delay)
+
+                    // During warmup: overwrite BOTH PBOs with current frame data to flush stale data
+                    if (pbosEnabled && pboWarmupFramesRemaining > 0) {
+                        for (int i = 0; i < 2; i++) {
+                            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[i]);
+                            glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, frame->data.data(), GL_STREAM_DRAW);
+                        }
+                        DEBUG_PRINT("Frame " << targetVideoFrame << ": Flushed both PBOs with current frame (warmup " << pboWarmupFramesRemaining << "/2)");
+                    }
+
+                    // Then upload texture synchronously (unbind PBO for immediate upload)
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                     glBindTexture(GL_TEXTURE_2D, texture);
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
                                 frame->width, frame->height, 0,
                                 GL_RGB, GL_UNSIGNED_BYTE, frame->data.data());
+
+                    if (pboWarmupFramesRemaining > 0) {
+                        DEBUG_PRINT("Frame " << targetVideoFrame << ": Sync upload (warmup " << pboWarmupFramesRemaining << "/2 - PBOs flushed)");
+                        pboWarmupFramesRemaining--;  // Count down warmup frames
+                    } else {
+                        DEBUG_PRINT("Frame " << targetVideoFrame << ": Sync upload (paused)");
+                    }
                 }
             }
 
             // Clear and render
             glClear(GL_COLOR_BUFFER_BIT);
 
-            // Calculate aspect ratio preserving letterbox
+            // Calculate rendering dimensions based on scale mode
             float videoAspect = (float)frame->width / (float)frame->height;
             float windowAspect = (float)windowWidth / (float)windowHeight;
 
             float renderWidth, renderHeight;
             float offsetX = 0, offsetY = 0;
 
-            if (windowAspect > videoAspect) {
-                // Window wider than video - letterbox sides
-                renderHeight = windowHeight;
-                renderWidth = windowHeight * videoAspect;
-                offsetX = (windowWidth - renderWidth) / 2.0f;
-            } else {
-                // Window taller than video - letterbox top/bottom
+            if (settings.scaleMode == "stretch") {
+                // Stretch to fill - ignore aspect ratio
                 renderWidth = windowWidth;
-                renderHeight = windowWidth / videoAspect;
-                offsetY = (windowHeight - renderHeight) / 2.0f;
+                renderHeight = windowHeight;
+            }
+            else if (settings.scaleMode == "crop") {
+                // Fill window, preserve aspect, crop edges (fit smallest dimension)
+                if (windowAspect > videoAspect) {
+                    // Window wider - fit width, crop top/bottom
+                    renderWidth = windowWidth;
+                    renderHeight = windowWidth / videoAspect;
+                    offsetY = (windowHeight - renderHeight) / 2.0f;
+                } else {
+                    // Window taller - fit height, crop sides
+                    renderHeight = windowHeight;
+                    renderWidth = windowHeight * videoAspect;
+                    offsetX = (windowWidth - renderWidth) / 2.0f;
+                }
+            }
+            else {
+                // Default: "letterbox" - fit inside, preserve aspect (fit largest dimension)
+                if (windowAspect > videoAspect) {
+                    // Window wider than video - letterbox sides
+                    renderHeight = windowHeight;
+                    renderWidth = windowHeight * videoAspect;
+                    offsetX = (windowWidth - renderWidth) / 2.0f;
+                } else {
+                    // Window taller than video - letterbox top/bottom
+                    renderWidth = windowWidth;
+                    renderHeight = windowWidth / videoAspect;
+                    offsetY = (windowHeight - renderHeight) / 2.0f;
+                }
             }
 
             // Draw textured quad
@@ -458,10 +525,7 @@ int main() {
         SDL_GL_SwapWindow(window);
     }
 
-    std::cout << "\nShutting down..." << std::endl;
-
     // Cleanup
-    DEBUG_PRINT("Cleaning up...");
     // JACK transport client will be automatically cleaned up via RAII
     if (pbosEnabled && glDeleteBuffers) {
         glDeleteBuffers(2, pbos);
@@ -470,7 +534,5 @@ int main() {
     SDL_GL_DeleteContext(glContext);
     SDL_DestroyWindow(window);
     SDL_Quit();
-
-    DEBUG_PRINT("Program ended normally");
     return 0;
 }

@@ -258,11 +258,13 @@ const VideoFrame* VideoPlayer::getCurrentFrame() {
         if (nearbyFrame >= 0 && nearbyFrame < totalFrames) {
             auto nearIt = frameCache.find(nearbyFrame);
             if (nearIt != frameCache.end()) {
+                DEBUG_PRINT("Frame " << frameIndex << " not cached, returning nearby frame " << nearbyFrame);
                 return &nearIt->second;
             }
         }
     }
 
+    DEBUG_PRINT("Frame " << frameIndex << " not available, no nearby frames in cache!");
     return nullptr;  // No frames available at all
 }
 
@@ -424,15 +426,16 @@ void VideoPlayer::backgroundDecoderTask() {
     int lastPlaybackFrame = 0;
 
     while (!shouldStopDecoder) {
-        if (!playing || !loaded) {
+        if (!loaded) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
         int currentFrame = currentFrameIndex.load(std::memory_order_relaxed);
 
-        // Keep decoder just 50 frames ahead of playback
-        const int DECODE_AHEAD = 50;
+        // When paused: decode only frames around current position (±10)
+        // When playing: decode 50 frames ahead
+        const int DECODE_AHEAD = playing ? 50 : 10;
 
         // If playback jumped (seek/loop), or decoder fell too far behind
         if (currentFrame < lastPlaybackFrame - 10 || currentFrame > lastPlaybackFrame + 200) {
@@ -440,6 +443,7 @@ void VideoPlayer::backgroundDecoderTask() {
             sequentialFrameIndex = currentFrame - 10;
             if (sequentialFrameIndex < 0) sequentialFrameIndex = 0;
             needSeek = true;
+            DEBUG_PRINT("Decoder jump detected! Current: " << currentFrame << ", Last: " << lastPlaybackFrame << ", Seeking to: " << sequentialFrameIndex);
         }
         lastPlaybackFrame = currentFrame;
 
@@ -500,8 +504,8 @@ void VideoPlayer::backgroundDecoderTask() {
 
                         frameDecoded = true;
 
-                        // Log progress every 50 frames
-                        if (sequentialFrameIndex % 50 == 0) {
+                        // Log progress every 50 frames (and always log frame 0)
+                        if (sequentialFrameIndex % 50 == 0 || sequentialFrameIndex == 0) {
                             DEBUG_PRINT("Decoded frame " << sequentialFrameIndex << "/" << totalFrames <<
                                        " (cache: " << frameCache.size() << " frames)");
                         }

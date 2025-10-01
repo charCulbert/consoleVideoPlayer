@@ -53,6 +53,14 @@ jack_nframes_t JackTransportClient::getCurrentFrame() {
     return pos.frame;
 }
 
+bool JackTransportClient::isTransportRolling() {
+    if (!client) return false;
+
+    jack_position_t pos;
+    jack_transport_state_t state = jack_transport_query(client, &pos);
+    return (state == JackTransportRolling);
+}
+
 jack_nframes_t JackTransportClient::getSampleRate() {
     if (!client) return 48000;  // Default fallback
     return jack_get_sample_rate(client);
