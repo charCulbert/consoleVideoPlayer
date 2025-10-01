@@ -23,7 +23,6 @@ find_package(OpenGL REQUIRED)
 set(SOURCES
     src/main.cpp
     src/VideoPlayer.cpp
-    src/UdpReceiver.cpp
     src/JackTransportClient.cpp
 )
 

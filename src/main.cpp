@@ -8,7 +8,6 @@
 #include <GL/glext.h>  // For PBO extensions
 
 #include "VideoPlayer.h"
-#include "UdpReceiver.h"
 #include "JackTransportClient.h"
 
 // PBO function pointers (manually loaded GL extensions)
@@ -49,10 +48,10 @@ struct Settings {
 std::string getConfigFilePath() {
     const std::string configName = "consoleVideoPlayer.config.json";
 
-    // Priority order: /var/lib/consoleSyncedPlayer/ -> ../ -> ./
+    // Priority order: /var/lib/consolePlayers/ -> ../ -> ./
     std::vector<std::string> searchPaths = {
 #ifdef __linux__
-        "/var/lib/consoleSyncedPlayer/" + configName,
+        "/var/lib/consolePlayers/" + configName,
 #endif
         "../" + configName,
         configName
@@ -324,8 +323,6 @@ int main() {
     bool running = true;
     SDL_Event event;
 
-    DEBUG_PRINT("Entering main render loop");
-
     while (running) {
         // Handle events
         while (SDL_PollEvent(&event)) {
@@ -349,26 +346,17 @@ int main() {
 
         // Sync video play/pause state to JACK Transport
         bool jackIsPlaying = jackTransport.isTransportRolling();
-        static bool lastJackState = jackIsPlaying;
         static int pboWarmupFramesRemaining = 0;  // Force sync upload for 2 frames to flush both PBOs
 
         if (jackIsPlaying && !videoPlayer.isPlaying()) {
-            DEBUG_PRINT("JACK started - playing video");
             videoPlayer.play();
             pboWarmupFramesRemaining = 2;  // Flush both PBO buffers with sync uploads
             // Reset PBO index to ensure clean state after warmup
             if (pbosEnabled) {
                 pboIndex = 0;
-                DEBUG_PRINT("PBO index reset for warmup");
             }
         } else if (!jackIsPlaying && videoPlayer.isPlaying()) {
-            DEBUG_PRINT("JACK stopped - pausing video");
             videoPlayer.pause();
-        }
-
-        if (lastJackState != jackIsPlaying) {
-            DEBUG_PRINT("JACK state changed: " << (jackIsPlaying ? "PLAYING" : "STOPPED"));
-            lastJackState = jackIsPlaying;
         }
 
         // Query JACK transport position and sync video to it
@@ -393,9 +381,6 @@ int main() {
         static int lastUploadedFrameIndex = -1;
         static int lastTargetVideoFrame = -1;
 
-        // Track actual frame index being displayed (from video player's currentFrameIndex)
-        int actualFrameIndex = videoPlayer.getCurrentFrameIndex();
-
         if (frame) {
             // Detect seeks: if target frame jumped by more than 5 frames, force PBO warmup
             // This flushes stale PBO buffers and ensures correct frame displays immediately
@@ -405,18 +390,8 @@ int main() {
                 if (pbosEnabled) {
                     pboIndex = 0;
                 }
-                DEBUG_PRINT("Seek detected: " << lastTargetVideoFrame << " -> " << targetVideoFrame << " (forcing 2-frame PBO flush)");
             }
             lastTargetVideoFrame = targetVideoFrame;
-
-            // Debug: Print frame info on every frame when we're around position 0 (or during seeks)
-            if (targetVideoFrame < 10 || pboWarmupFramesRemaining > 0) {
-                DEBUG_PRINT(">>> RENDERING: Target=" << targetVideoFrame
-                          << " Actual=" << actualFrameIndex
-                          << " JACK=" << currentJackFrame
-                          << " Warmup=" << pboWarmupFramesRemaining
-                          << " Playing=" << (videoPlayer.isPlaying() ? "YES" : "NO"));
-            }
 
             // Upload when target frame index changes (not just pointer)
             // This ensures texture updates even when getCurrentFrame() returns same cached frame during seeks
@@ -439,7 +414,6 @@ int main() {
 
                     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                     pboIndex = (pboIndex + 1) % 2;
-                    DEBUG_PRINT("Frame " << targetVideoFrame << ": PBO upload (1-frame delay)");
                 } else {
                     // Paused, warming up, or PBOs unavailable: synchronous upload (immediate, no delay)
 
@@ -449,7 +423,6 @@ int main() {
                             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[i]);
                             glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, frame->data.data(), GL_STREAM_DRAW);
                         }
-                        DEBUG_PRINT("Frame " << targetVideoFrame << ": Flushed both PBOs with current frame (warmup " << pboWarmupFramesRemaining << "/2)");
                     }
 
                     // Then upload texture synchronously (unbind PBO for immediate upload)
@@ -460,10 +433,7 @@ int main() {
                                 GL_RGB, GL_UNSIGNED_BYTE, frame->data.data());
 
                     if (pboWarmupFramesRemaining > 0) {
-                        DEBUG_PRINT("Frame " << targetVideoFrame << ": Sync upload (warmup " << pboWarmupFramesRemaining << "/2 - PBOs flushed)");
                         pboWarmupFramesRemaining--;  // Count down warmup frames
-                    } else {
-                        DEBUG_PRINT("Frame " << targetVideoFrame << ": Sync upload (paused)");
                     }
                 }
             }

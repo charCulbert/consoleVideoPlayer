@@ -1,6 +1,6 @@
 {
   "videoFilePath": "/home/char/Downloads/video.mp4",
-  "udpPort": 8080,
-  "fullscreen": false,
-  "windowTitle": "Video Player"
+  "fullscreen": true,
+  "windowTitle": "Video Player",
+  "scaleMode": "stretch"
 }

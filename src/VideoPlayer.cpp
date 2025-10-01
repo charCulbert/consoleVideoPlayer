@@ -194,18 +194,15 @@ void VideoPlayer::play() {
     if (!loaded) return;
     playing = true;
     lastFrameTime = std::chrono::steady_clock::now();
-    DEBUG_PRINT("Playing");
 }
 
 void VideoPlayer::pause() {
     playing = false;
-    DEBUG_PRINT("Paused");
 }
 
 void VideoPlayer::stop() {
     playing = false;
     currentFrameIndex = 0;
-    DEBUG_PRINT("Stopped");
 }
 
 void VideoPlayer::seek(double seconds) {
@@ -258,13 +255,11 @@ const VideoFrame* VideoPlayer::getCurrentFrame() {
         if (nearbyFrame >= 0 && nearbyFrame < totalFrames) {
             auto nearIt = frameCache.find(nearbyFrame);
             if (nearIt != frameCache.end()) {
-                DEBUG_PRINT("Frame " << frameIndex << " not cached, returning nearby frame " << nearbyFrame);
                 return &nearIt->second;
             }
         }
     }
 
-    DEBUG_PRINT("Frame " << frameIndex << " not available, no nearby frames in cache!");
     return nullptr;  // No frames available at all
 }
 
@@ -282,7 +277,6 @@ void VideoPlayer::update() {
         }
 
         // External sync timed out - fall back to internal timer
-        DEBUG_PRINT("External sync timeout - falling back to internal timer");
         externalSyncActive.store(false, std::memory_order_relaxed);
         lastFrameTime = now; // Reset timer
     }
@@ -443,7 +437,6 @@ void VideoPlayer::backgroundDecoderTask() {
             sequentialFrameIndex = currentFrame - 10;
             if (sequentialFrameIndex < 0) sequentialFrameIndex = 0;
             needSeek = true;
-            DEBUG_PRINT("Decoder jump detected! Current: " << currentFrame << ", Last: " << lastPlaybackFrame << ", Seeking to: " << sequentialFrameIndex);
         }
         lastPlaybackFrame = currentFrame;
 
@@ -503,12 +496,6 @@ void VideoPlayer::backgroundDecoderTask() {
                         }
 
                         frameDecoded = true;
-
-                        // Log progress every 50 frames (and always log frame 0)
-                        if (sequentialFrameIndex % 50 == 0 || sequentialFrameIndex == 0) {
-                            DEBUG_PRINT("Decoded frame " << sequentialFrameIndex << "/" << totalFrames <<
-                                       " (cache: " << frameCache.size() << " frames)");
-                        }
 
                         sequentialFrameIndex++;
 
