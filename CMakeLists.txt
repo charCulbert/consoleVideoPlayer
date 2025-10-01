@@ -14,6 +14,7 @@ pkg_check_modules(LIBAV REQUIRED
     libavutil
     libswscale
 )
+pkg_check_modules(JACK REQUIRED jack)
 
 # OpenGL
 find_package(OpenGL REQUIRED)
@@ -22,7 +23,7 @@ find_package(OpenGL REQUIRED)
 set(SOURCES
     src/main.cpp
     src/VideoPlayer.cpp
-    src/UdpReceiver.cpp
+    src/JackTransportClient.cpp
 )
 
 # Create executable
@@ -33,6 +34,7 @@ target_include_directories(consoleVideoPlayer PRIVATE
     ${SDL2_INCLUDE_DIRS}
     ${LIBAV_INCLUDE_DIRS}
     ${OPENGL_INCLUDE_DIRS}
+    ${JACK_INCLUDE_DIRS}
 )
 
 # Link libraries
@@ -40,6 +42,7 @@ target_link_libraries(consoleVideoPlayer
     ${SDL2_LIBRARIES}
     ${LIBAV_LIBRARIES}
     ${OPENGL_LIBRARIES}
+    ${JACK_LIBRARIES}
     pthread
 )
 
