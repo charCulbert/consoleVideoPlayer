@@ -409,17 +409,15 @@ void VideoPlayer::evictOldFrames() {
 void VideoPlayer::backgroundDecoderTask() {
     DEBUG_PRINT("Background decoder thread started");
 
-    std::lock_guard<std::mutex> decoderLock(decoderMutex);
-
     AVPacket* packet = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     int numBytes = width * height * 3;
 
-    int sequentialFrameIndex = 0;  // Start from beginning
+    int sequentialFrameIndex = 0;
     bool needSeek = true;
     int lastPlaybackFrame = 0;
 
-    while (!shouldStopDecoder) {
+    while (!shouldStopDecoder) {  // Check at top of loop
         if (!loaded) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
@@ -427,20 +425,15 @@ void VideoPlayer::backgroundDecoderTask() {
 
         int currentFrame = currentFrameIndex.load(std::memory_order_relaxed);
 
-        // When paused: decode only frames around current position (±10)
-        // When playing: decode 50 frames ahead
         const int DECODE_AHEAD = playing ? 50 : 10;
 
-        // If playback jumped (seek/loop), or decoder fell too far behind
         if (currentFrame < lastPlaybackFrame - 10 || currentFrame > lastPlaybackFrame + 200) {
-            // Jump detected - seek decoder to just behind current position
             sequentialFrameIndex = currentFrame - 10;
             if (sequentialFrameIndex < 0) sequentialFrameIndex = 0;
             needSeek = true;
         }
         lastPlaybackFrame = currentFrame;
 
-        // If we're already too far ahead, wait
         if (sequentialFrameIndex > currentFrame + DECODE_AHEAD) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
@@ -459,63 +452,74 @@ void VideoPlayer::backgroundDecoderTask() {
             }
         }
 
-        // Seek if needed
-        if (needSeek) {
-            int64_t timestamp = (int64_t)(sequentialFrameIndex / fps * AV_TIME_BASE);
-            av_seek_frame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(codecContext);
-            needSeek = false;
-        }
-
-        // Decode next frame sequentially
+        // CRITICAL FIX: Only lock during FFmpeg operations, not entire loop
         bool frameDecoded = false;
-        if (av_read_frame(formatContext, packet) >= 0) {
-            if (packet->stream_index == videoStreamIndex) {
-                if (avcodec_send_packet(codecContext, packet) >= 0) {
-                    if (avcodec_receive_frame(codecContext, frame) >= 0) {
-                        // Convert to RGB24
-                        VideoFrame vf;
-                        vf.width = width;
-                        vf.height = height;
-                        vf.linesize = width * 3;
-                        vf.data.resize(numBytes);
+        {
+            std::lock_guard<std::mutex> decoderLock(decoderMutex);
+            
+            // Check shutdown flag again after acquiring lock
+            if (shouldStopDecoder) break;
 
-                        uint8_t* dest[1] = { vf.data.data() };
-                        int destLinesize[1] = { vf.linesize };
+            // Seek if needed
+            if (needSeek) {
+                int64_t timestamp = (int64_t)(sequentialFrameIndex / fps * AV_TIME_BASE);
+                av_seek_frame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD);
+                avcodec_flush_buffers(codecContext);
+                needSeek = false;
+            }
 
-                        sws_scale(swsContext,
-                                 frame->data, frame->linesize, 0, height,
-                                 dest, destLinesize);
+            // Decode next frame sequentially
+            if (av_read_frame(formatContext, packet) >= 0) {
+                if (packet->stream_index == videoStreamIndex) {
+                    if (avcodec_send_packet(codecContext, packet) >= 0) {
+                        if (avcodec_receive_frame(codecContext, frame) >= 0) {
+                            // Convert to RGB24
+                            VideoFrame vf;
+                            vf.width = width;
+                            vf.height = height;
+                            vf.linesize = width * 3;
+                            vf.data.resize(numBytes);
 
-                        // Add to cache
-                        {
-                            std::lock_guard<std::mutex> lock(cacheMutex);
-                            frameCache[sequentialFrameIndex] = std::move(vf);
-                            cacheOrder.push_back(sequentialFrameIndex);
-                            evictOldFrames();
-                        }
+                            uint8_t* dest[1] = { vf.data.data() };
+                            int destLinesize[1] = { vf.linesize };
 
-                        frameDecoded = true;
+                            sws_scale(swsContext,
+                                     frame->data, frame->linesize, 0, height,
+                                     dest, destLinesize);
 
-                        sequentialFrameIndex++;
+                            // Add to cache
+                            {
+                                std::lock_guard<std::mutex> lock(cacheMutex);
+                                frameCache[sequentialFrameIndex] = std::move(vf);
+                                cacheOrder.push_back(sequentialFrameIndex);
+                                evictOldFrames();
+                            }
 
-                        if (sequentialFrameIndex >= totalFrames) {
-                            sequentialFrameIndex = 0;
-                            needSeek = true;
+                            frameDecoded = true;
+
+                            sequentialFrameIndex++;
+
+                            if (sequentialFrameIndex >= totalFrames) {
+                                sequentialFrameIndex = 0;
+                                needSeek = true;
+                            }
                         }
                     }
                 }
+                av_packet_unref(packet);
+            } else {
+                // EOF - wrap to beginning
+                sequentialFrameIndex = 0;
+                needSeek = true;
             }
-            av_packet_unref(packet);
-        } else {
-            // EOF - wrap to beginning
-            sequentialFrameIndex = 0;
-            needSeek = true;
-        }
+        }  // decoderLock released here
 
         if (!frameDecoded) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+
+        // Check shutdown flag frequently
+        if (shouldStopDecoder) break;
     }
 
     av_frame_free(&frame);
