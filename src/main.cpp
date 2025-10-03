@@ -321,10 +321,7 @@ int main() {
     std::cout << "✓ JACK Transport synced (" << jackSampleRate << " Hz)" << std::endl;
     std::cout << "✓ Playback latency: " << playbackLatency << " frames ("
               << std::fixed << std::setprecision(1) << (latencySeconds * 1000.0) << " ms)" << std::endl;
-    std::cout << "\nReady. Press ESC or Q to quit.\n" << std::endl;
-
-    // Start playing
-    videoPlayer.play();
+    std::cout << "\nReady. Waiting for JACK Transport... (ESC or Q to quit)\n" << std::endl;
 
     // Main render loop
     bool running = true;
@@ -338,12 +335,6 @@ int main() {
             } else if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
                     running = false;
-                } else if (event.key.keysym.sym == SDLK_SPACE) {
-                    if (videoPlayer.isPlaying()) {
-                        videoPlayer.pause();
-                    } else {
-                        videoPlayer.play();
-                    }
                 }
             }
         }
