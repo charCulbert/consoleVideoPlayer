@@ -39,119 +39,88 @@ void signal_handler(int sig) {
 } while(0)
 
 struct Settings {
-    std::string videoFilePath = "../test_video.mp4";
-    int udpPort = 8080;
-    bool fullscreen = true;
-    std::string windowTitle = "Video Player";
+    std::string videoFilePath;
+    double syncOffsetMs = 0.0;
+    bool fullscreen = false;
     std::string scaleMode = "letterbox";  // Options: "letterbox", "stretch", "crop"
 };
 
-std::string getConfigFilePath() {
-    const std::string configName = "consoleVideoPlayer.config.json";
-
-    // Priority order: /var/lib/consolePlayers/ -> ../ -> ./
-    std::vector<std::string> searchPaths = {
-#ifdef __linux__
-        "/var/lib/consolePlayers/" + configName,
-#endif
-        "../" + configName,
-        configName
-    };
-
-    for (const auto& path : searchPaths) {
-        if (std::filesystem::exists(path)) {
-            return path;
-        }
-    }
-
-    // If none exist, return the first path (will use defaults)
-    return searchPaths[0];
+void showHelp(const char* programName) {
+    std::cout << "Usage: " << programName << " <video_file> [options]\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  -o, --offset <ms>       Sync offset in milliseconds (default: 0.0)\n";
+    std::cout << "                          Positive = delay video (video plays later)\n";
+    std::cout << "                          Negative = advance video (video plays earlier)\n";
+    std::cout << "                          Example: -o 15.5 or --offset -10.0\n\n";
+    std::cout << "  -f, --fullscreen        Enable fullscreen mode (default: windowed)\n\n";
+    std::cout << "  -s, --scale <mode>      Video scaling mode (default: letterbox)\n";
+    std::cout << "                          letterbox - fit inside, preserve aspect, add bars\n";
+    std::cout << "                          stretch   - fill window, ignore aspect ratio\n";
+    std::cout << "                          crop      - fill window, preserve aspect, crop edges\n\n";
+    std::cout << "  -h, --help              Show this help message\n\n";
+    std::cout << "Examples:\n";
+    std::cout << "  " << programName << " video.mp4\n";
+    std::cout << "  " << programName << " video.mp4 --offset 15.0 --fullscreen\n";
+    std::cout << "  " << programName << " video.mp4 -o -10.5 -f -s stretch\n";
 }
 
-// Simple JSON parser for our limited needs
-std::map<std::string, std::string> parseSimpleJson(const std::string& content) {
-    std::map<std::string, std::string> result;
-    size_t pos = 0;
-
-    while (pos < content.size()) {
-        size_t keyStart = content.find('"', pos);
-        if (keyStart == std::string::npos) break;
-        keyStart++;
-
-        size_t keyEnd = content.find('"', keyStart);
-        if (keyEnd == std::string::npos) break;
-
-        std::string key = content.substr(keyStart, keyEnd - keyStart);
-
-        size_t valueStart = content.find(':', keyEnd);
-        if (valueStart == std::string::npos) break;
-        valueStart++;
-
-        // Skip whitespace
-        while (valueStart < content.size() && (content[valueStart] == ' ' || content[valueStart] == '\t' || content[valueStart] == '\n')) {
-            valueStart++;
-        }
-
-        std::string value;
-        if (content[valueStart] == '"') {
-            // String value
-            valueStart++;
-            size_t valueEnd = content.find('"', valueStart);
-            if (valueEnd == std::string::npos) break;
-            value = content.substr(valueStart, valueEnd - valueStart);
-            pos = valueEnd + 1;
-        } else if (content[valueStart] == 't' || content[valueStart] == 'f') {
-            // Boolean
-            size_t valueEnd = content.find_first_of(",}", valueStart);
-            if (valueEnd == std::string::npos) valueEnd = content.size();
-            value = content.substr(valueStart, valueEnd - valueStart);
-            // Trim
-            size_t end = value.find_last_not_of(" \t\n\r");
-            if (end != std::string::npos) value = value.substr(0, end + 1);
-            pos = valueEnd;
-        } else {
-            // Number
-            size_t valueEnd = content.find_first_of(",}", valueStart);
-            if (valueEnd == std::string::npos) valueEnd = content.size();
-            value = content.substr(valueStart, valueEnd - valueStart);
-            // Trim
-            size_t end = value.find_last_not_of(" \t\n\r");
-            if (end != std::string::npos) value = value.substr(0, end + 1);
-            pos = valueEnd;
-        }
-
-        result[key] = value;
-    }
-
-    return result;
-}
-
-Settings loadSettings() {
+Settings parseCommandLine(int argc, char* argv[]) {
     Settings settings;
-    const std::string settingsFile = getConfigFilePath();
 
-    try {
-        if (std::filesystem::exists(settingsFile)) {
-            std::ifstream file(settingsFile);
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string content = buffer.str();
-
-            auto json = parseSimpleJson(content);
-
-            if (json.count("videoFilePath")) settings.videoFilePath = json["videoFilePath"];
-            if (json.count("udpPort")) settings.udpPort = std::stoi(json["udpPort"]);
-            if (json.count("fullscreen")) {
-                std::string fullscreenValue = json["fullscreen"];
-                settings.fullscreen = (fullscreenValue == "true");
-            }
-            if (json.count("windowTitle")) settings.windowTitle = json["windowTitle"];
-            if (json.count("scaleMode")) settings.scaleMode = json["scaleMode"];
-
+    // Check for help first
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-h" || std::string(argv[i]) == "--help") {
+            showHelp(argv[0]);
+            exit(0);
         }
-    } catch (const std::exception& e) {
-        std::cout << "Warning: Could not load settings, using defaults: " << e.what() << std::endl;
     }
+
+    // Require at least video file
+    if (argc < 2) {
+        std::cerr << "Error: No video file specified\n\n";
+        showHelp(argv[0]);
+        exit(1);
+    }
+
+    settings.videoFilePath = argv[1];
+
+    // Parse optional flags
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "-o" || arg == "--offset") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a value\n";
+                exit(1);
+            }
+            try {
+                settings.syncOffsetMs = std::stod(argv[++i]);
+            } catch (...) {
+                std::cerr << "Error: Invalid offset value: " << argv[i] << "\n";
+                exit(1);
+            }
+        } else if (arg == "-f" || arg == "--fullscreen") {
+            settings.fullscreen = true;
+        } else if (arg == "-s" || arg == "--scale") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a value\n";
+                exit(1);
+            }
+            settings.scaleMode = argv[++i];
+            if (settings.scaleMode != "letterbox" &&
+                settings.scaleMode != "stretch" &&
+                settings.scaleMode != "crop") {
+                std::cerr << "Error: Invalid scale mode: " << settings.scaleMode << "\n";
+                std::cerr << "Valid modes: letterbox, stretch, crop\n";
+                exit(1);
+            }
+        } else {
+            std::cerr << "Error: Unknown option: " << arg << "\n\n";
+            showHelp(argv[0]);
+            exit(1);
+        }
+    }
+
     return settings;
 }
 
@@ -160,7 +129,7 @@ Settings loadSettings() {
 // VideoPlayer* g_videoPlayer = nullptr;
 // void handleCommand(const std::string& command) { ... }
 
-int main() {
+int main(int argc, char* argv[]) {
     // Install signal handlers
     signal(SIGSEGV, signal_handler);
     signal(SIGABRT, signal_handler);
@@ -168,7 +137,7 @@ int main() {
     std::cout << "Console Video Player (JACK Sync)" << std::endl;
     std::cout << "=================================" << std::endl;
 
-    auto settings = loadSettings();
+    auto settings = parseCommandLine(argc, argv);
 
     // Check if video file exists
     if (!std::filesystem::exists(settings.videoFilePath)) {
@@ -207,7 +176,7 @@ int main() {
     }
 
     SDL_Window* window = SDL_CreateWindow(
-        settings.windowTitle.c_str(),
+        "Console Video Player",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
         windowWidth, windowHeight,
@@ -315,6 +284,13 @@ int main() {
     double fps = videoPlayer.getFPS();
 
     std::cout << "✓ JACK Transport synced (" << jackSampleRate << " Hz)" << std::endl;
+
+    if (settings.syncOffsetMs != 0.0) {
+        std::cout << "✓ Sync offset: " << std::fixed << std::setprecision(1)
+                  << settings.syncOffsetMs << " ms "
+                  << (settings.syncOffsetMs > 0 ? "(video delayed)" : "(video advanced)") << std::endl;
+    }
+
     std::cout << "\nReady. Waiting for JACK Transport... (ESC or Q to quit)\n" << std::endl;
 
     // Main render loop
@@ -353,8 +329,21 @@ int main() {
 
         // Query JACK transport position and sync video to it
         jack_nframes_t currentJackFrame = jackTransport.getCurrentFrame();
-        double currentSeconds = (double)currentJackFrame / jackSampleRate;
-        int targetVideoFrame = (int)(currentSeconds * fps);
+
+        // Convert to seconds and apply sync offset
+        double jackSeconds = (double)currentJackFrame / jackSampleRate;
+        double offsetSeconds = settings.syncOffsetMs / 1000.0;
+        double adjustedSeconds = jackSeconds - offsetSeconds;
+
+        // Handle wrap-around at file boundaries
+        double fileDuration = videoPlayer.getDuration();
+        if (adjustedSeconds < 0) {
+            adjustedSeconds += fileDuration;  // Wrap to end of file
+        } else if (adjustedSeconds >= fileDuration) {
+            adjustedSeconds -= fileDuration;  // Wrap to start
+        }
+
+        int targetVideoFrame = (int)(adjustedSeconds * fps);
 
         // Clamp to valid frame range
         int totalFrames = videoPlayer.getFrameCount();
@@ -366,7 +355,7 @@ int main() {
         }
 
         // Always seek to JACK transport position (works even when paused)
-        videoPlayer.seek(currentSeconds);
+        videoPlayer.seek(adjustedSeconds);
 
         // Get current frame
         const VideoFrame* frame = videoPlayer.getCurrentFrame();
