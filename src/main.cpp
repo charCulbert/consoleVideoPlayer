@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>
 #include <filesystem>
 #include <signal.h>
 #include <execinfo.h>
@@ -313,7 +314,13 @@ int main() {
     jack_nframes_t jackSampleRate = jackTransport.getSampleRate();
     double fps = videoPlayer.getFPS();
 
+    // Get audio playback latency for video sync compensation
+    jack_nframes_t playbackLatency = jackTransport.getPlaybackLatency();
+    double latencySeconds = (double)playbackLatency / jackSampleRate;
+
     std::cout << "✓ JACK Transport synced (" << jackSampleRate << " Hz)" << std::endl;
+    std::cout << "✓ Playback latency: " << playbackLatency << " frames ("
+              << std::fixed << std::setprecision(1) << (latencySeconds * 1000.0) << " ms)" << std::endl;
     std::cout << "\nReady. Press ESC or Q to quit.\n" << std::endl;
 
     // Start playing
@@ -361,7 +368,12 @@ int main() {
 
         // Query JACK transport position and sync video to it
         jack_nframes_t currentJackFrame = jackTransport.getCurrentFrame();
-        double currentSeconds = (double)currentJackFrame / jackSampleRate;
+
+        // Apply latency compensation: delay video by audio output latency
+        // Audio takes 'playbackLatency' frames to reach speakers, so video must show earlier position
+        jack_nframes_t compensatedFrame = currentJackFrame > playbackLatency ?
+                                           currentJackFrame - playbackLatency : 0;
+        double currentSeconds = (double)compensatedFrame / jackSampleRate;
         int targetVideoFrame = (int)(currentSeconds * fps);
 
         // Clamp to valid frame range

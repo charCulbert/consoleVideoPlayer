@@ -21,6 +21,9 @@ public:
     // Get JACK sample rate
     jack_nframes_t getSampleRate();
 
+    // Get system playback latency (audio output latency)
+    jack_nframes_t getPlaybackLatency();
+
 private:
     jack_client_t* client = nullptr;
     std::string errorMessage;

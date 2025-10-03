@@ -65,3 +65,26 @@ jack_nframes_t JackTransportClient::getSampleRate() {
     if (!client) return 48000;  // Default fallback
     return jack_get_sample_rate(client);
 }
+
+jack_nframes_t JackTransportClient::getPlaybackLatency() {
+    if (!client) return 0;
+
+    // Query system playback ports to get audio output latency
+    const char** ports = jack_get_ports(client, "system:playback_", nullptr, JackPortIsInput);
+    if (!ports || !ports[0]) {
+        if (ports) jack_free(ports);
+        return 0;
+    }
+
+    // Get latency from first system playback port
+    jack_port_t* port = jack_port_by_name(client, ports[0]);
+    jack_free(ports);
+
+    if (!port) return 0;
+
+    jack_latency_range_t range;
+    jack_port_get_latency_range(port, JackPlaybackLatency, &range);
+
+    // Return maximum latency (worst case for sync)
+    return range.max;
+}
