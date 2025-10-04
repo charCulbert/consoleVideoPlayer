@@ -33,6 +33,7 @@ public:
     bool init(const char* fontPath, int fontSize);
     void render(VideoPlayer& player, const VideoInfo& videoInfo, const DisplaySettings& displaySettings);
     void toggle();
+    void shutdown();  // Call before TTF_Quit()
     bool isEnabled() const { return enabled; }
 
 private:

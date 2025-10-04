@@ -446,7 +446,8 @@ int main(int argc, char* argv[]) {
         SDL_GL_SwapWindow(window);
     }
 
-    // Cleanup
+    // Cleanup (close overlay font before TTF_Quit)
+    overlay.shutdown();
     TTF_Quit();
     glDeleteTextures(1, &texture);
     SDL_GL_DeleteContext(glContext);

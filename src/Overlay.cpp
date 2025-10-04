@@ -9,6 +9,7 @@ Overlay::~Overlay() {
     cleanup();
     if (font) {
         TTF_CloseFont(font);
+        font = nullptr;
     }
 }
 
@@ -79,6 +80,14 @@ void Overlay::toggle() {
     enabled = !enabled;
     if (!enabled) {
         cleanup();
+    }
+}
+
+void Overlay::shutdown() {
+    cleanup();
+    if (font) {
+        TTF_CloseFont(font);
+        font = nullptr;
     }
 }
 
@@ -278,7 +287,7 @@ void Overlay::render(VideoPlayer& player, const VideoInfo& videoInfo, const Disp
     // Keyboard help (always on)
     if (!helpTex) {
         std::string helpText =
-            "I:Overlay  F:Fullscreen  S:Scale  Arrows:Offset  0:Reset  Q:Quit";
+            "I:Overlay  F:Fullscreen  S:Scale  Arrows:Offset  0:Reset  C:CopyCmd  Q:Quit";
         SDL_Color yellow = {255, 255, 0, 255};
         helpTex = renderTextToTexture(helpText, yellow, helpW, helpH);
     }

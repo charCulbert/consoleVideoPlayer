@@ -68,6 +68,28 @@ bool KeyboardController::handleEvent(const SDL_Event& event) {
             case SDLK_s:
                 cycleScaleMode();
                 break;
+
+            case SDLK_c: {
+                // Print command to reproduce current state
+                std::string cmd = "./build/consoleVideoPlayer " + settings.videoFilePath;
+
+                if (settings.syncOffsetMs != 0.0) {
+                    char offsetBuf[32];
+                    snprintf(offsetBuf, sizeof(offsetBuf), " --offset %.1f", settings.syncOffsetMs);
+                    cmd += offsetBuf;
+                }
+
+                if (settings.fullscreen) {
+                    cmd += " --fullscreen";
+                }
+
+                if (settings.scaleMode != "letterbox") {
+                    cmd += " --scale " + settings.scaleMode;
+                }
+
+                std::cout << "\nCommand to reproduce current state:\n" << cmd << "\n" << std::endl;
+                break;
+            }
         }
     }
 
