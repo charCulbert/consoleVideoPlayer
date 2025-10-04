@@ -1,5 +1,16 @@
+/*
+ * VideoPlayer.cpp - JACK-synced video player with seamless looping
+ *
+ * Key features:
+ * - Background decoder continuously decodes ahead of playback position
+ * - Wraps at loop boundaries automatically (handles positive/negative sync offsets)
+ * - LRU frame cache (300 frames ~600MB for 720p)
+ * - Pre-loads first 150 frames for instant startup and smooth loop point
+ */
+
 #include "VideoPlayer.h"
 #include <iostream>
+#include <iomanip>
 #include <cstring>
 #include <cmath>
 
@@ -38,8 +49,6 @@ void VideoPlayer::closeFFmpegContexts() {
 }
 
 bool VideoPlayer::loadVideo(const std::string& filePath) {
-    DEBUG_PRINT("Loading video: " << filePath);
-
     // Open video file
     if (avformat_open_input(&formatContext, filePath.c_str(), nullptr, nullptr) < 0) {
         errorMessage = "Failed to open video file";
@@ -77,11 +86,35 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
     duration = (double)formatContext->duration / AV_TIME_BASE;
     totalFrames = (int)(duration * fps);
 
-    DEBUG_PRINT("Video info: " << codecParams->width << "x" << codecParams->height
-                << " @ " << fps << " fps, duration: " << duration << "s, frames: " << totalFrames);
+    // Find decoder - try hardware first, fallback to software
+    const AVCodec* codec = nullptr;
+    const char* hwDecoderName = nullptr;
 
-    // Find decoder
-    const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+    // Determine hardware decoder based on codec and platform
+    if (codecParams->codec_id == AV_CODEC_ID_H264) {
+        #ifdef __APPLE__
+            hwDecoderName = "h264_videotoolbox";
+        #else
+            hwDecoderName = "h264_vaapi";  // VA-API (Intel/AMD on Linux)
+        #endif
+    } else if (codecParams->codec_id == AV_CODEC_ID_HEVC) {
+        #ifdef __APPLE__
+            hwDecoderName = "hevc_videotoolbox";
+        #else
+            hwDecoderName = "hevc_vaapi";
+        #endif
+    }
+
+    // Try hardware decoder
+    if (hwDecoderName) {
+        codec = avcodec_find_decoder_by_name(hwDecoderName);
+    }
+
+    // Fallback to software decoder
+    if (!codec) {
+        codec = avcodec_find_decoder(codecParams->codec_id);
+    }
+
     if (!codec) {
         errorMessage = "Codec not found";
         closeFFmpegContexts();
@@ -103,10 +136,37 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
 
     codecContext->thread_count = 0;
 
+    // Try to open codec (hardware might fail, so fallback to software)
     if (avcodec_open2(codecContext, codec, nullptr) < 0) {
-        errorMessage = "Failed to open codec";
-        closeFFmpegContexts();
-        return false;
+        if (hwDecoderName) {
+            avcodec_free_context(&codecContext);
+
+            // Retry with software decoder
+            codec = avcodec_find_decoder(codecParams->codec_id);
+            if (!codec) {
+                errorMessage = "Codec not found";
+                closeFFmpegContexts();
+                return false;
+            }
+
+            codecContext = avcodec_alloc_context3(codec);
+            if (!codecContext || avcodec_parameters_to_context(codecContext, codecParams) < 0) {
+                errorMessage = "Failed to allocate codec context";
+                closeFFmpegContexts();
+                return false;
+            }
+
+            codecContext->thread_count = 0;
+            if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+                errorMessage = "Failed to open codec";
+                closeFFmpegContexts();
+                return false;
+            }
+        } else {
+            errorMessage = "Failed to open codec";
+            closeFFmpegContexts();
+            return false;
+        }
     }
 
     width = codecContext->width;
@@ -125,20 +185,17 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
         return false;
     }
 
-    // Pre-load first 150 frames sequentially (fast startup + seamless looping)
-    DEBUG_PRINT("Pre-loading first 150 frames...");
+    // Pre-load first frames for smooth startup and seamless looping
+    int maxPreload = std::min(PRELOAD_FRAMES, totalFrames);
 
     AVPacket* packet = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
-    int numBytes = width * height * 3;
     int frameCount = 0;
-    int maxPreload = std::min(150, totalFrames);
 
-    // Seek to beginning
     av_seek_frame(formatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(codecContext);
 
-    // Decode sequentially (no seeking per frame - much faster!)
+    // Sequential decode (much faster than per-frame seeking)
     while (av_read_frame(formatContext, packet) >= 0 && frameCount < maxPreload) {
         if (packet->stream_index == videoStreamIndex) {
             if (avcodec_send_packet(codecContext, packet) >= 0) {
@@ -147,24 +204,17 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
                     vf.width = width;
                     vf.height = height;
                     vf.linesize = width * 3;
-                    vf.data.resize(numBytes);
+                    vf.data.resize(width * height * 3);
 
                     uint8_t* dest[1] = { vf.data.data() };
                     int destLinesize[1] = { vf.linesize };
+                    sws_scale(swsContext, frame->data, frame->linesize, 0, height, dest, destLinesize);
 
-                    sws_scale(swsContext,
-                             frame->data, frame->linesize, 0, height,
-                             dest, destLinesize);
+                    std::lock_guard<std::mutex> lock(cacheMutex);
+                    frameCache[frameCount] = std::move(vf);
+                    cacheOrder.push_back(frameCount);
 
-                    // Add to cache
-                    {
-                        std::lock_guard<std::mutex> lock(cacheMutex);
-                        frameCache[frameCount] = std::move(vf);
-                        cacheOrder.push_back(frameCount);
-                    }
-
-                    frameCount++;
-                    if (frameCount >= maxPreload) break;
+                    if (++frameCount >= maxPreload) break;
                 }
             }
         }
@@ -174,19 +224,11 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
     av_frame_free(&frame);
     av_packet_free(&packet);
 
-    DEBUG_PRINT("Pre-loaded " << frameCount << " frames");
-
-    // Calculate expected memory usage
-    size_t expectedMemory = MAX_CACHED_FRAMES * width * height * 3;
-    double memoryMB = (double)expectedMemory / (1024.0 * 1024.0);
-    DEBUG_PRINT("Ring buffer size: " << MAX_CACHED_FRAMES << " frames (~" << memoryMB << " MB)");
-
     // Start background decoder thread
     shouldStopDecoder = false;
     decoderThread = std::thread(&VideoPlayer::backgroundDecoderTask, this);
 
     loaded = true;
-    DEBUG_PRINT("Video loaded successfully (on-demand decoding enabled)");
     return true;
 }
 
@@ -209,29 +251,17 @@ void VideoPlayer::seek(double seconds) {
     if (!loaded || totalFrames == 0) return;
 
     int targetFrame = (int)(seconds * fps);
-    currentFrameIndex = std::max(0, std::min(targetFrame, totalFrames - 1));
+    currentFrameIndex = wrapFrameIndex(targetFrame);
     lastFrameTime = std::chrono::steady_clock::now();
-
-    // DEBUG_PRINT("Seeked to " << seconds << "s (frame " << currentFrameIndex << ")");
 }
 
 void VideoPlayer::syncToTimestamp(double audioTimestamp) {
-    if (!loaded || totalFrames == 0 || !playing) return;
+    if (!loaded || totalFrames == 0) return;
 
-    // Calculate target frame from audio timestamp
-    // Handle looping: take modulo of video duration
-    double loopedTime = std::fmod(audioTimestamp, duration);
-    if (loopedTime < 0) loopedTime += duration;
+    // Set frame index to exact JACK timecode (even when paused!)
+    int targetFrame = (int)(audioTimestamp * fps);
 
-    int targetFrame = (int)(loopedTime * fps);
-
-    // Clamp to valid range
-    targetFrame = std::max(0, std::min(targetFrame, totalFrames - 1));
-
-    // Update frame index directly - no accumulation, no drift!
     currentFrameIndex.store(targetFrame, std::memory_order_relaxed);
-
-    // Mark external sync as active and update timestamp
     externalSyncActive.store(true, std::memory_order_relaxed);
     lastSyncTime = std::chrono::steady_clock::now();
 }
@@ -239,268 +269,228 @@ void VideoPlayer::syncToTimestamp(double audioTimestamp) {
 const VideoFrame* VideoPlayer::getCurrentFrame() {
     if (!loaded) return nullptr;
 
-    int frameIndex = currentFrameIndex.load(std::memory_order_relaxed);
-    ensureFrameLoaded(frameIndex);
-
+    int requestedFrame = currentFrameIndex.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(cacheMutex);
-    auto it = frameCache.find(frameIndex);
+
+    // Is requested frame in cache?
+    auto it = frameCache.find(requestedFrame);
     if (it != frameCache.end()) {
+        // Frame found! Remember it as last valid
+        lastValidFrameIndex = requestedFrame;
         return &it->second;
     }
 
-    // Frame not in cache yet - return closest available frame to avoid blank screen
-    // Try nearby frames (decoder might be slightly behind)
-    for (int offset = -5; offset <= 5; offset++) {
-        int nearbyFrame = frameIndex + offset;
-        if (nearbyFrame >= 0 && nearbyFrame < totalFrames) {
-            auto nearIt = frameCache.find(nearbyFrame);
-            if (nearIt != frameCache.end()) {
-                return &nearIt->second;
-            }
+    // Frame not in cache - hold last valid frame
+    if (lastValidFrameIndex >= 0) {
+        auto lastIt = frameCache.find(lastValidFrameIndex);
+        if (lastIt != frameCache.end()) {
+            return &lastIt->second;
         }
     }
 
-    return nullptr;  // No frames available at all
+    // No frame available
+    return nullptr;
+}
+
+int VideoPlayer::getBufferedFrameCount(int startFrame, int maxCheck) {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+
+    int count = 0;
+    for (int i = 0; i < maxCheck; i++) {
+        // Handle wrap-around properly
+        int frameIdx = wrapFrameIndex(startFrame + i);
+
+        if (frameCache.find(frameIdx) != frameCache.end()) {
+            count++;
+        } else {
+            break;  // Stop at first missing frame
+        }
+    }
+    return count;
 }
 
 void VideoPlayer::update() {
     if (!playing || !loaded || totalFrames == 0) return;
 
-    // Check if external sync is active (receiving SYNC messages at 1kHz)
+    // External sync active? Check if still receiving sync messages
     if (externalSyncActive.load(std::memory_order_relaxed)) {
         auto now = std::chrono::steady_clock::now();
-        auto timeSinceLastSync = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyncTime);
+        auto timeSinceSync = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyncTime);
 
-        // If we've received SYNC within last 100ms, external clock is driving - do nothing
-        if (timeSinceLastSync.count() < 100) {
-            return; // External sync active - skip internal timer
-        }
+        if (timeSinceSync.count() < 100) return;  // Still synced, nothing to do
 
-        // External sync timed out - fall back to internal timer
+        // Sync lost - fall back to internal timer
         externalSyncActive.store(false, std::memory_order_relaxed);
-        lastFrameTime = now; // Reset timer
+        lastFrameTime = now;
     }
 
-    // Fallback: timer-based frame advancement (when no external sync)
+    // Internal timer-based advancement (fallback when no external sync)
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastFrameTime);
 
-    // Advance frames based on elapsed time
     while (elapsed >= frameDuration) {
-        currentFrameIndex++;
-
-        // Loop back to start
-        if (currentFrameIndex >= totalFrames) {
-            currentFrameIndex = 0;
-        }
-
+        currentFrameIndex = wrapFrameIndex(currentFrameIndex + 1);
         elapsed -= frameDuration;
         lastFrameTime += frameDuration;
     }
 }
-// Decode a single frame at the specified index
-bool VideoPlayer::decodeFrame(int frameIndex) {
-    if (frameIndex < 0 || frameIndex >= totalFrames) return false;
-
-    // Check if already cached
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        if (frameCache.find(frameIndex) != frameCache.end()) {
-            return true;  // Already decoded
-        }
-    }
-
-    // Lock FFmpeg contexts (NOT thread-safe!)
-    std::lock_guard<std::mutex> decoderLock(decoderMutex);
-
-    // Seek to the frame's timestamp
-    int64_t timestamp = (int64_t)(frameIndex / fps * AV_TIME_BASE);
-    if (av_seek_frame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD) < 0) {
-        return false;
-    }
-
-    avcodec_flush_buffers(codecContext);
-
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-
-    bool frameDecoded = false;
-    int64_t targetPts = av_rescale_q(frameIndex,
-                                     AVRational{1, (int)fps},
-                                     formatContext->streams[videoStreamIndex]->time_base);
-
-    // Safety limit: don't read more than 2 seconds worth of frames
-    int maxFramesToRead = (int)(fps * 2);
-    int framesRead = 0;
-
-    // Read packets until we find our frame
-    while (av_read_frame(formatContext, packet) >= 0 && framesRead < maxFramesToRead) {
-        if (packet->stream_index == videoStreamIndex) {
-            if (avcodec_send_packet(codecContext, packet) >= 0) {
-                while (avcodec_receive_frame(codecContext, frame) >= 0) {
-                    int64_t framePts = frame->best_effort_timestamp;
-                    framesRead++;
-
-                    // Check if this is close to our target frame
-                    if (std::abs(framePts - targetPts) < fps / 2) {
-                        // This is our frame! Convert to RGB24
-                        VideoFrame vf;
-                        vf.width = width;
-                        vf.height = height;
-                        vf.linesize = width * 3;
-                        vf.data.resize(width * height * 3);
-
-                        uint8_t* dest[1] = { vf.data.data() };
-                        int destLinesize[1] = { vf.linesize };
-
-                        sws_scale(swsContext,
-                                 frame->data, frame->linesize, 0, height,
-                                 dest, destLinesize);
-
-                        // Add to cache
-                        {
-                            std::lock_guard<std::mutex> lock(cacheMutex);
-                            frameCache[frameIndex] = std::move(vf);
-                            cacheOrder.push_back(frameIndex);
-                            evictOldFrames();
-                        }
-
-                        frameDecoded = true;
-                        break;
-                    }
-                }
-            }
-        }
-        av_packet_unref(packet);
-
-        if (frameDecoded) break;
-    }
-
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-
-    return frameDecoded;
+// Wrap frame index to valid range [0, totalFrames)
+int VideoPlayer::wrapFrameIndex(int frameIndex) const {
+    if (totalFrames == 0) return 0;
+    frameIndex %= totalFrames;
+    if (frameIndex < 0) frameIndex += totalFrames;
+    return frameIndex;
 }
 
-// Ensure a frame is loaded (non-blocking - background thread will handle it)
-void VideoPlayer::ensureFrameLoaded(int frameIndex) {
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    if (frameCache.find(frameIndex) != frameCache.end()) {
-        return;  // Already loaded
+// Calculate signed circular distance from->to (handles wraparound)
+// Returns: positive if 'to' is ahead of 'from', negative if behind
+int VideoPlayer::circularDistance(int from, int to) const {
+    if (totalFrames == 0) return 0;
+    int distance = to - from;
+
+    // Handle wraparound: choose shortest path
+    if (distance > totalFrames / 2) {
+        distance -= totalFrames;
+    } else if (distance < -totalFrames / 2) {
+        distance += totalFrames;
     }
 
-    // Not in cache - background decoder thread will fetch it
-    // Don't block the render thread!
+    return distance;
 }
 
-// Evict old frames if cache is too large (LRU)
+// Evict frames that are behind playback (streaming buffer - pop as we pass them)
 void VideoPlayer::evictOldFrames() {
     // Must be called with cacheMutex locked
-    while (frameCache.size() > MAX_CACHED_FRAMES) {
-        if (cacheOrder.empty()) break;
+    int playbackPos = currentFrameIndex.load(std::memory_order_relaxed);
 
+    // Remove ANY frames behind playback (we'll never show them again)
+    auto it = cacheOrder.begin();
+    while (it != cacheOrder.end()) {
+        int frameIdx = *it;
+        int distance = frameIdx - playbackPos;
+
+        // Handle wraparound
+        if (distance < -totalFrames / 2) distance += totalFrames;
+        else if (distance > totalFrames / 2) distance -= totalFrames;
+
+        // If frame is behind playback (even by 1), evict it
+        if (distance < 0) {
+            frameCache.erase(frameIdx);
+            it = cacheOrder.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Safety: if somehow still over limit, evict oldest
+    while (frameCache.size() > MAX_CACHED_FRAMES && !cacheOrder.empty()) {
         int oldestFrame = cacheOrder.front();
         cacheOrder.pop_front();
         frameCache.erase(oldestFrame);
     }
 }
 
-// Background decoder thread - sequential decode ahead of playback
+// Background decoder: continuously decode ahead of playback for smooth rendering
 void VideoPlayer::backgroundDecoderTask() {
-    DEBUG_PRINT("Background decoder thread started");
-
     AVPacket* packet = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
-    int numBytes = width * height * 3;
+    if (!packet || !frame) {
+        av_packet_free(&packet);
+        av_frame_free(&frame);
+        return;
+    }
 
-    int sequentialFrameIndex = 0;
+    int decoderPos = 0;
     bool needSeek = true;
-    int lastPlaybackFrame = 0;
 
-    while (!shouldStopDecoder) {  // Check at top of loop
+    while (!shouldStopDecoder) {
         if (!loaded) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
-        int currentFrame = currentFrameIndex.load(std::memory_order_relaxed);
+        // What frame does playback need?
+        int playbackPos = currentFrameIndex.load(std::memory_order_relaxed);
+        int decodeAhead = playing ? DECODE_AHEAD_FRAMES : 20;
 
-        const int DECODE_AHEAD = playing ? 50 : 10;
-
-        if (currentFrame < lastPlaybackFrame - 10 || currentFrame > lastPlaybackFrame + 200) {
-            sequentialFrameIndex = currentFrame - 10;
-            if (sequentialFrameIndex < 0) sequentialFrameIndex = 0;
+        // Is decoder in the useful range [playback, playback + decodeAhead]?
+        // Check this FIRST so seeking while paused works
+        int distance = circularDistance(decoderPos, playbackPos);
+        // Only seek if decoder is way behind (>50) or way too far ahead (> decodeAhead + 50)
+        if (distance > 50 || distance < -(decodeAhead + 50)) {
+            // Out of range - seek to playback position
+            decoderPos = playbackPos;
             needSeek = true;
         }
-        lastPlaybackFrame = currentFrame;
 
-        if (sequentialFrameIndex > currentFrame + DECODE_AHEAD) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // Are we buffered enough from playback position? If so, wait
+        int bufferedCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            for (int i = 0; i < decodeAhead; i++) {
+                int checkFrame = wrapFrameIndex(playbackPos + i);
+                if (frameCache.find(checkFrame) != frameCache.end()) {
+                    bufferedCount++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (bufferedCount >= decodeAhead) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
-        // Check if already cached
+        // Is current decoder frame already cached? Skip it
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
-            if (frameCache.find(sequentialFrameIndex) != frameCache.end()) {
-                sequentialFrameIndex++;
-                if (sequentialFrameIndex >= totalFrames) {
-                    sequentialFrameIndex = 0;
-                    needSeek = true;
-                }
+            if (frameCache.find(decoderPos) != frameCache.end()) {
+                decoderPos = wrapFrameIndex(decoderPos + 1);
+                if (decoderPos == 0) needSeek = true;  // Wrapped around
                 continue;
             }
         }
 
-        // CRITICAL FIX: Only lock during FFmpeg operations, not entire loop
-        bool frameDecoded = false;
+        // Decode the frame at decoderPos
+        bool decoded = false;
         {
             std::lock_guard<std::mutex> decoderLock(decoderMutex);
-            
-            // Check shutdown flag again after acquiring lock
             if (shouldStopDecoder) break;
 
-            // Seek if needed
             if (needSeek) {
-                int64_t timestamp = (int64_t)(sequentialFrameIndex / fps * AV_TIME_BASE);
+                int64_t timestamp = (int64_t)(decoderPos / fps * AV_TIME_BASE);
                 av_seek_frame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD);
                 avcodec_flush_buffers(codecContext);
                 needSeek = false;
             }
 
-            // Decode next frame sequentially
             if (av_read_frame(formatContext, packet) >= 0) {
                 if (packet->stream_index == videoStreamIndex) {
                     if (avcodec_send_packet(codecContext, packet) >= 0) {
                         if (avcodec_receive_frame(codecContext, frame) >= 0) {
-                            // Convert to RGB24
                             VideoFrame vf;
                             vf.width = width;
                             vf.height = height;
                             vf.linesize = width * 3;
-                            vf.data.resize(numBytes);
+                            vf.data.resize(width * height * 3);
 
                             uint8_t* dest[1] = { vf.data.data() };
                             int destLinesize[1] = { vf.linesize };
+                            sws_scale(swsContext, frame->data, frame->linesize, 0, height, dest, destLinesize);
 
-                            sws_scale(swsContext,
-                                     frame->data, frame->linesize, 0, height,
-                                     dest, destLinesize);
+                            decoded = true;
+                            int currentDecoderPos = decoderPos;
 
-                            // Add to cache
                             {
                                 std::lock_guard<std::mutex> lock(cacheMutex);
-                                frameCache[sequentialFrameIndex] = std::move(vf);
-                                cacheOrder.push_back(sequentialFrameIndex);
+                                frameCache[currentDecoderPos] = std::move(vf);
+                                cacheOrder.push_back(currentDecoderPos);
                                 evictOldFrames();
                             }
 
-                            frameDecoded = true;
-
-                            sequentialFrameIndex++;
-
-                            if (sequentialFrameIndex >= totalFrames) {
-                                sequentialFrameIndex = 0;
+                            decoderPos = wrapFrameIndex(decoderPos + 1);
+                            if (decoderPos == 0) {
                                 needSeek = true;
                             }
                         }
@@ -508,22 +498,16 @@ void VideoPlayer::backgroundDecoderTask() {
                 }
                 av_packet_unref(packet);
             } else {
-                // EOF - wrap to beginning
-                sequentialFrameIndex = 0;
+                // EOF - wrap
+                decoderPos = 0;
                 needSeek = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-        }  // decoderLock released here
-
-        if (!frameDecoded) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // Check shutdown flag frequently
-        if (shouldStopDecoder) break;
+        if (!decoded) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     av_frame_free(&frame);
     av_packet_free(&packet);
-
-    DEBUG_PRINT("Background decoder thread stopped");
 }

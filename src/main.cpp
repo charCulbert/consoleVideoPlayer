@@ -1,21 +1,23 @@
 #include <iostream>
 #include <iomanip>
 #include <filesystem>
+#include <cmath>
 #include <signal.h>
 #include <execinfo.h>
 #include <unistd.h>
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
+#ifdef __APPLE__
+#include <OpenGL/gl.h>
+#else
 #include <GL/gl.h>
-#include <GL/glext.h>  // For PBO extensions
+#endif
 
 #include "VideoPlayer.h"
 #include "JackTransportClient.h"
+#include "Overlay.h"
 
-// PBO function pointers (manually loaded GL extensions)
-PFNGLGENBUFFERSPROC glGenBuffers = nullptr;
-PFNGLDELETEBUFFERSPROC glDeleteBuffers = nullptr;
-PFNGLBINDBUFFERPROC glBindBuffer = nullptr;
-PFNGLBUFFERDATAPROC glBufferData = nullptr;
+// PBOs removed - they add 1-frame latency. Direct texture upload is fast enough.
 
 // Simple JSON parser for config (minimal implementation)
 #include <fstream>
@@ -157,7 +159,7 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     // Create window
-    Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
+    Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS;
     int windowWidth = 1280;
     int windowHeight = 720;
 
@@ -198,19 +200,28 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Load PBO extension functions manually
-    glGenBuffers = (PFNGLGENBUFFERSPROC)SDL_GL_GetProcAddress("glGenBuffers");
-    glDeleteBuffers = (PFNGLDELETEBUFFERSPROC)SDL_GL_GetProcAddress("glDeleteBuffers");
-    glBindBuffer = (PFNGLBINDBUFFERPROC)SDL_GL_GetProcAddress("glBindBuffer");
-    glBufferData = (PFNGLBUFFERDATAPROC)SDL_GL_GetProcAddress("glBufferData");
-
-    if (!glGenBuffers || !glDeleteBuffers || !glBindBuffer || !glBufferData) {
-        std::cout << "⚠ PBOs not supported - using synchronous texture uploads" << std::endl;
-        // Continue without PBOs - will use fallback path
+    // Initialize SDL_ttf
+    if (TTF_Init() < 0) {
+        std::cerr << "TTF initialization failed: " << TTF_GetError() << std::endl;
+        SDL_GL_DeleteContext(glContext);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
     }
+
+    // Initialize overlay
+    Overlay overlay;
+    if (!overlay.init("/System/Library/Fonts/Courier.ttc", 24)) {
+        std::cerr << "Warning: Could not load font, overlay disabled" << std::endl;
+    }
+
+    // PBOs removed for lower latency (direct upload is fast enough for HD video)
 
     // Enable vsync
     SDL_GL_SetSwapInterval(1);
+
+    // Dropped frames counter (only when decoder fails to provide requested frame)
+    int droppedFrames = 0;
 
     // Get actual window size
     SDL_GetWindowSize(window, &windowWidth, &windowHeight);
@@ -238,25 +249,7 @@ int main(int argc, char* argv[]) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    // Setup PBOs (Pixel Buffer Objects) for async texture uploads (if available)
-    GLuint pbos[2] = {0, 0};
-    size_t pboSize = videoPlayer.getWidth() * videoPlayer.getHeight() * 3; // RGB24
-    int pboIndex = 0;      // Current PBO for uploading
-    bool pbosEnabled = false;
-
-    if (glGenBuffers && glBindBuffer && glBufferData) {
-        glGenBuffers(2, pbos);
-
-        // Initialize both PBOs
-        for (int i = 0; i < 2; i++) {
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[i]);
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, nullptr, GL_STREAM_DRAW);
-        }
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); // Unbind
-
-        pbosEnabled = true;
-        std::cout << "✓ PBO double-buffering enabled" << std::endl;
-    }
+    // Direct texture uploads (PBOs removed to eliminate 1-frame latency)
 
     // Setup OpenGL viewport
     glViewport(0, 0, windowWidth, windowHeight);
@@ -305,119 +298,72 @@ int main(int argc, char* argv[]) {
             } else if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
                     running = false;
+                } else if (event.key.keysym.sym == SDLK_i) {
+                    overlay.toggle();
+                    std::cout << "Overlay " << (overlay.isEnabled() ? "ON" : "OFF") << std::endl;
                 }
             }
         }
 
-        // Update video player
-        videoPlayer.update();
+        // Simple deterministic logic:
+        // 1. Get time from JACK
+        // 2. Apply offset (wrapping handled by syncToTimestamp)
+        // 3. Sync video to that time (sets target frame, decoder follows)
+        // 4. Get frame (exact if ready, nearby if not)
+        // 5. Upload and render
 
-        // Sync video play/pause state to JACK Transport
-        bool jackIsPlaying = jackTransport.isTransportRolling();
-        static int pboWarmupFramesRemaining = 0;  // Force sync upload for 2 frames to flush both PBOs
-
-        if (jackIsPlaying && !videoPlayer.isPlaying()) {
+        // Sync play/pause state
+        if (jackTransport.isTransportRolling() && !videoPlayer.isPlaying()) {
             videoPlayer.play();
-            pboWarmupFramesRemaining = 2;  // Flush both PBO buffers with sync uploads
-            // Reset PBO index to ensure clean state after warmup
-            if (pbosEnabled) {
-                pboIndex = 0;
-            }
-        } else if (!jackIsPlaying && videoPlayer.isPlaying()) {
+        } else if (!jackTransport.isTransportRolling() && videoPlayer.isPlaying()) {
             videoPlayer.pause();
         }
 
-        // Query JACK transport position and sync video to it
-        jack_nframes_t currentJackFrame = jackTransport.getCurrentFrame();
+        // Step 1: Get JACK time and CLAMP to file duration (hold last frame if past end)
+        jack_nframes_t jackFrame = jackTransport.getCurrentFrame();
+        double jackTime = (double)jackFrame / jackSampleRate;
+        double duration = videoPlayer.getDuration();
 
-        // Convert to seconds and apply sync offset
-        double jackSeconds = (double)currentJackFrame / jackSampleRate;
-        double offsetSeconds = settings.syncOffsetMs / 1000.0;
-        double adjustedSeconds = jackSeconds - offsetSeconds;
+        // Clamp JACK time to [0, duration]
+        double clampedJackTime = jackTime;
+        if (clampedJackTime < 0) clampedJackTime = 0;
+        if (clampedJackTime > duration) clampedJackTime = duration;
 
-        // Handle wrap-around at file boundaries
-        double fileDuration = videoPlayer.getDuration();
-        if (adjustedSeconds < 0) {
-            adjustedSeconds += fileDuration;  // Wrap to end of file
-        } else if (adjustedSeconds >= fileDuration) {
-            adjustedSeconds -= fileDuration;  // Wrap to start
+        // Step 2: Apply offset
+        double offsetSec = settings.syncOffsetMs / 1000.0;
+        double videoTime = clampedJackTime - offsetSec;  // positive offset = delay video, negative = advance
+
+        // Step 3: Wrap ONLY if offset made it negative (wraps to end of video)
+        if (videoTime < 0) {
+            videoTime = fmod(videoTime, duration);
+            if (videoTime < 0) videoTime += duration;
+        }
+        // If videoTime > duration, clamp to last frame
+        if (videoTime > duration) {
+            videoTime = duration - 0.001;  // Just before end
         }
 
-        int targetVideoFrame = (int)(adjustedSeconds * fps);
+        // Step 2: Convert to frame number
+        int targetFrame = (int)(videoTime * videoPlayer.getFPS());
+        if (targetFrame >= videoPlayer.getFrameCount()) targetFrame = videoPlayer.getFrameCount() - 1;
+        if (targetFrame < 0) targetFrame = 0;
 
-        // Clamp to valid frame range
-        int totalFrames = videoPlayer.getFrameCount();
-        if (targetVideoFrame >= totalFrames) {
-            targetVideoFrame = totalFrames - 1;
-        }
-        if (targetVideoFrame < 0) {
-            targetVideoFrame = 0;
-        }
+        // Step 3: Set playback position
+        videoPlayer.syncToTimestamp(videoTime);
 
-        // Always seek to JACK transport position (works even when paused)
-        videoPlayer.seek(adjustedSeconds);
-
-        // Get current frame
+        // Step 4: Get frame from cache (getCurrentFrame handles holding last valid frame)
         const VideoFrame* frame = videoPlayer.getCurrentFrame();
-        static int lastUploadedFrameIndex = -1;
-        static int lastTargetVideoFrame = -1;
 
+        // Count dropped frames only when decoder fails to provide the requested frame
+        if (!frame) {
+            droppedFrames++;
+        }
+
+        // Upload directly to GPU (no PBO delay)
         if (frame) {
-            // Detect seeks: if target frame jumped by more than 5 frames, force PBO warmup
-            // This flushes stale PBO buffers and ensures correct frame displays immediately
-            if (lastTargetVideoFrame != -1 && std::abs(targetVideoFrame - lastTargetVideoFrame) > 5) {
-                pboWarmupFramesRemaining = 2;  // Flush both PBO buffers
-                // Reset PBO index to ensure clean state after warmup
-                if (pbosEnabled) {
-                    pboIndex = 0;
-                }
-            }
-            lastTargetVideoFrame = targetVideoFrame;
-
-            // Upload when target frame index changes (not just pointer)
-            // This ensures texture updates even when getCurrentFrame() returns same cached frame during seeks
-            if (targetVideoFrame != lastUploadedFrameIndex) {
-                lastUploadedFrameIndex = targetVideoFrame;
-
-                // Use PBOs only when playing (1-frame delay is acceptable during motion)
-                // When paused or warming up PBOs, use synchronous upload for immediate visual feedback
-                if (pbosEnabled && videoPlayer.isPlaying() && pboWarmupFramesRemaining == 0) {
-                    // PBO double-buffering path: async upload (1-frame delay)
-                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[pboIndex]);
-                    glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, frame->data.data(), GL_STREAM_DRAW);
-
-                    glBindTexture(GL_TEXTURE_2D, texture);
-                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[(pboIndex + 1) % 2]);
-
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
-                                frame->width, frame->height, 0,
-                                GL_RGB, GL_UNSIGNED_BYTE, nullptr); // nullptr = use bound PBO
-
-                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-                    pboIndex = (pboIndex + 1) % 2;
-                } else {
-                    // Paused, warming up, or PBOs unavailable: synchronous upload (immediate, no delay)
-
-                    // During warmup: overwrite BOTH PBOs with current frame data to flush stale data
-                    if (pbosEnabled && pboWarmupFramesRemaining > 0) {
-                        for (int i = 0; i < 2; i++) {
-                            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbos[i]);
-                            glBufferData(GL_PIXEL_UNPACK_BUFFER, pboSize, frame->data.data(), GL_STREAM_DRAW);
-                        }
-                    }
-
-                    // Then upload texture synchronously (unbind PBO for immediate upload)
-                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-                    glBindTexture(GL_TEXTURE_2D, texture);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
-                                frame->width, frame->height, 0,
-                                GL_RGB, GL_UNSIGNED_BYTE, frame->data.data());
-
-                    if (pboWarmupFramesRemaining > 0) {
-                        pboWarmupFramesRemaining--;  // Count down warmup frames
-                    }
-                }
-            }
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame->width, frame->height,
+                        0, GL_RGB, GL_UNSIGNED_BYTE, frame->data.data());
 
             // Clear and render
             glClear(GL_COLOR_BUFFER_BIT);
@@ -470,6 +416,9 @@ int main(int argc, char* argv[]) {
             glTexCoord2f(1, 1); glVertex2f(offsetX + renderWidth, offsetY + renderHeight);
             glTexCoord2f(0, 1); glVertex2f(offsetX, offsetY + renderHeight);
             glEnd();
+
+            // Draw overlay
+            overlay.render(videoPlayer, droppedFrames);
         }
 
         // Swap buffers
@@ -477,10 +426,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
-    // JACK transport client will be automatically cleaned up via RAII
-    if (pbosEnabled && glDeleteBuffers) {
-        glDeleteBuffers(2, pbos);
-    }
+    TTF_Quit();
     glDeleteTextures(1, &texture);
     SDL_GL_DeleteContext(glContext);
     SDL_DestroyWindow(window);

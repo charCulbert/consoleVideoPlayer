@@ -44,6 +44,9 @@ public:
     // Get current frame for rendering
     const VideoFrame* getCurrentFrame();
 
+    // Check how many frames are buffered starting from a position
+    int getBufferedFrameCount(int startFrame, int maxCheck);
+
     // Update playback position (call regularly) - fallback timer-based method
     void update();
 
@@ -74,21 +77,26 @@ private:
     std::atomic<int> currentFrameIndex{0};
     std::chrono::steady_clock::time_point lastFrameTime;
     std::chrono::microseconds frameDuration{0};
+    int lastValidFrameIndex = -1;  // Last successfully displayed frame (held when frame not in cache)
 
     // Sync mode tracking - when receiving external clock sync, disable internal timer
     std::atomic<bool> externalSyncActive{false};
     std::chrono::steady_clock::time_point lastSyncTime;
 
-    // Frame cache (ring buffer) - on-demand decoding
+    // Frame cache configuration
     static constexpr size_t MAX_CACHED_FRAMES = 300;  // ~600MB for 720p
+    static constexpr int DECODE_AHEAD_FRAMES = 150;   // Decode this many frames ahead (more buffer = smoother)
+    static constexpr int PRELOAD_FRAMES = 150;        // Frames to preload at startup
+    static constexpr int SEEK_THRESHOLD = 50;         // If decoder is this far from playback, seek instead of sequential decode
+    static constexpr int BUFFER_RESUME_THRESHOLD = 20; // Minimum consecutive frames needed to exit buffering state
+
+    // Frame cache (LRU ring buffer)
     std::unordered_map<int, VideoFrame> frameCache;
-    std::list<int> cacheOrder;  // LRU tracking
+    std::list<int> cacheOrder;
     mutable std::mutex cacheMutex;
 
-    // FFmpeg decoder mutex (FFmpeg contexts are NOT thread-safe)
+    // FFmpeg contexts (NOT thread-safe - must lock decoderMutex)
     std::mutex decoderMutex;
-
-    // FFmpeg contexts (kept open for on-demand decoding)
     AVFormatContext* formatContext = nullptr;
     AVCodecContext* codecContext = nullptr;
     SwsContext* swsContext = nullptr;
@@ -97,12 +105,11 @@ private:
     // Background decoder thread
     std::thread decoderThread;
     std::atomic<bool> shouldStopDecoder{false};
-    std::atomic<int> lastDecodedFrame{-1};
 
-    // Private methods
-    bool decodeFrame(int frameIndex);
-    void ensureFrameLoaded(int frameIndex);
+    // Helper methods
+    void closeFFmpegContexts();
     void backgroundDecoderTask();
     void evictOldFrames();
-    void closeFFmpegContexts();
+    int wrapFrameIndex(int frameIndex) const;
+    int circularDistance(int from, int to) const;  // Signed distance from->to with wraparound
 };
