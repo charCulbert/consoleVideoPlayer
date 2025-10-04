@@ -377,6 +377,8 @@ void VideoPlayer::evictOldFrames() {
     int playbackPos = currentFrameIndex.load(std::memory_order_relaxed);
 
     // Remove ANY frames behind playback (we'll never show them again)
+    int evictedCount = 0;
+    std::vector<int> evictedFrames;
     auto it = cacheOrder.begin();
     while (it != cacheOrder.end()) {
         int frameIdx = *it;
@@ -388,18 +390,39 @@ void VideoPlayer::evictOldFrames() {
 
         // If frame is behind playback (even by 1), evict it
         if (distance < 0) {
+            if (playbackPos > 250 || playbackPos < 50 || frameIdx > 250 || frameIdx < 50) {
+                evictedFrames.push_back(frameIdx);
+            }
             frameCache.erase(frameIdx);
             it = cacheOrder.erase(it);
+            evictedCount++;
         } else {
             ++it;
         }
     }
 
+    if (!evictedFrames.empty()) {
+        std::cout << "[EVICT] Removed " << evictedCount << " frames behind playback=" << playbackPos << " [";
+        for (size_t i = 0; i < std::min(evictedFrames.size(), (size_t)10); i++) {
+            if (i > 0) std::cout << ",";
+            std::cout << evictedFrames[i];
+        }
+        if (evictedFrames.size() > 10) std::cout << "...";
+        std::cout << "]" << std::endl;
+    }
+
     // Safety: if somehow still over limit, evict oldest
+    int overflowEvicted = 0;
     while (frameCache.size() > MAX_CACHED_FRAMES && !cacheOrder.empty()) {
         int oldestFrame = cacheOrder.front();
         cacheOrder.pop_front();
         frameCache.erase(oldestFrame);
+        overflowEvicted++;
+    }
+
+    if (overflowEvicted > 0) {
+        std::cout << "[EVICT OVERFLOW] Removed " << overflowEvicted
+                  << " frames (cache exceeded MAX_CACHED_FRAMES)" << std::endl;
     }
 }
 
@@ -429,15 +452,41 @@ void VideoPlayer::backgroundDecoderTask() {
         // Is decoder in the useful range [playback, playback + decodeAhead]?
         // Check this FIRST so seeking while paused works
         int distance = circularDistance(decoderPos, playbackPos);
-        // Only seek if decoder is way behind (>50) or way too far ahead (> decodeAhead + 50)
-        if (distance > 50 || distance < -(decodeAhead + 50)) {
+        // Only seek if decoder is behind or way too far ahead (> decodeAhead + 50)
+        if (distance > 0 || distance < -(decodeAhead + 50)) {
             // Out of range - seek to playback position
-            decoderPos = playbackPos;
+            std::cout << "[SEEK] Decoder out of range: decoder=" << decoderPos
+                      << " playback=" << playbackPos << " distance=" << distance << std::endl;
+
+            // Find first uncached frame from playback position
+            int targetPos = -1;
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                for (int i = 0; i < decodeAhead; i++) {
+                    int checkFrame = wrapFrameIndex(playbackPos + i);
+                    if (frameCache.find(checkFrame) == frameCache.end()) {
+                        targetPos = checkFrame;
+                        break;
+                    }
+                }
+            }
+
+            // If all frames are cached, move decoder to end of buffer to avoid re-triggering seek
+            if (targetPos == -1) {
+                decoderPos = wrapFrameIndex(playbackPos + decodeAhead - 1);
+                std::cout << "[SEEK SKIP] All frames cached, moving decoder to " << decoderPos << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            decoderPos = targetPos;
             needSeek = true;
+            std::cout << "[SEEK TARGET] Moving decoder to first uncached frame: " << targetPos << std::endl;
         }
 
         // Are we buffered enough from playback position? If so, wait
         int bufferedCount = 0;
+        int firstMissing = -1;
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
             for (int i = 0; i < decodeAhead; i++) {
@@ -445,8 +494,20 @@ void VideoPlayer::backgroundDecoderTask() {
                 if (frameCache.find(checkFrame) != frameCache.end()) {
                     bufferedCount++;
                 } else {
+                    if (firstMissing == -1) firstMissing = checkFrame;
                     break;
                 }
+            }
+        }
+
+        if (playbackPos > 250 || playbackPos < 50) {
+            std::cout << "[BUFFER CHECK] playback=" << playbackPos << " decoder=" << decoderPos
+                      << " buffered=" << bufferedCount << "/" << decodeAhead
+                      << " firstMissing=" << firstMissing;
+            if (bufferedCount >= decodeAhead) {
+                std::cout << " -> SLEEPING" << std::endl;
+            } else {
+                std::cout << " -> NEED MORE" << std::endl;
             }
         }
 
@@ -455,12 +516,28 @@ void VideoPlayer::backgroundDecoderTask() {
             continue;
         }
 
-        // Is current decoder frame already cached? Skip it
+        // Is current decoder frame already cached? Skip ALL consecutive cached frames
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
             if (frameCache.find(decoderPos) != frameCache.end()) {
-                decoderPos = wrapFrameIndex(decoderPos + 1);
-                if (decoderPos == 0) needSeek = true;  // Wrapped around
+                int startPos = decoderPos;
+                int skippedCount = 0;
+
+                // Skip all consecutive cached frames in one go
+                while (frameCache.find(decoderPos) != frameCache.end() && skippedCount < MAX_CACHED_FRAMES) {
+                    int prevPos = decoderPos;
+                    decoderPos = wrapFrameIndex(decoderPos + 1);
+                    skippedCount++;
+
+                    if (decoderPos == 0) {
+                        needSeek = true;  // Wrapped around
+                    }
+                }
+
+                if (playbackPos > 250 || playbackPos < 50 || skippedCount > 10) {
+                    std::cout << "[SKIP CACHED] Skipped " << skippedCount << " frames: "
+                              << startPos << "→" << decoderPos << " (playback=" << playbackPos << ")" << std::endl;
+                }
                 continue;
             }
         }
@@ -473,6 +550,8 @@ void VideoPlayer::backgroundDecoderTask() {
 
             if (needSeek) {
                 int64_t timestamp = (int64_t)(decoderPos / fps * AV_TIME_BASE);
+                std::cout << "[SEEKING] to frame " << decoderPos << " timestamp=" << timestamp
+                          << " (playback=" << playbackPos << ")" << std::endl;
                 av_seek_frame(formatContext, -1, timestamp, AVSEEK_FLAG_BACKWARD);
                 avcodec_flush_buffers(codecContext);
                 needSeek = false;
@@ -502,9 +581,15 @@ void VideoPlayer::backgroundDecoderTask() {
                                 evictOldFrames();
                             }
 
+                            int prevPos = decoderPos;
                             decoderPos = wrapFrameIndex(decoderPos + 1);
                             if (decoderPos == 0) {
+                                std::cout << "[WRAP DECODE] Decoder wrapped " << prevPos << "→0 (playback="
+                                          << playbackPos << ")" << std::endl;
                                 needSeek = true;
+                            } else if (playbackPos > 250 || playbackPos < 50) {
+                                std::cout << "[DECODED] frame " << currentDecoderPos << ", decoder now at "
+                                          << decoderPos << " (playback=" << playbackPos << ")" << std::endl;
                             }
                         }
                     }
@@ -512,6 +597,8 @@ void VideoPlayer::backgroundDecoderTask() {
                 av_packet_unref(packet);
             } else {
                 // EOF - wrap
+                std::cout << "[EOF] Reached end of file, wrapping decoder to 0 (playback="
+                          << playbackPos << ")" << std::endl;
                 decoderPos = 0;
                 needSeek = true;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
