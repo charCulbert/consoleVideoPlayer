@@ -1,6 +1,7 @@
 #include "Overlay.h"
 #include "VideoPlayer.h"
 #include <cstdio>
+#include <iostream>
 
 Overlay::Overlay() {}
 
@@ -29,12 +30,49 @@ void Overlay::cleanup() {
         glDeleteTextures(1, &frameTextTex);
         frameTextTex = 0;
     }
-    if (droppedFramesTextTex) {
-        glDeleteTextures(1, &droppedFramesTextTex);
-        droppedFramesTextTex = 0;
+    if (videoInfoTex) {
+        glDeleteTextures(1, &videoInfoTex);
+        videoInfoTex = 0;
+    }
+    if (settingsTex) {
+        glDeleteTextures(1, &settingsTex);
+        settingsTex = 0;
+    }
+    if (commandTex) {
+        glDeleteTextures(1, &commandTex);
+        commandTex = 0;
+    }
+    if (helpTex) {
+        glDeleteTextures(1, &helpTex);
+        helpTex = 0;
     }
     lastRenderedFrame = -1;
-    lastRenderedDroppedFrames = -1;
+    lastRenderedOffset = 99999.0;
+    lastScaleMode.clear();
+    lastFullscreen = false;
+    lastCommandOffset = 99999.0;
+    lastCommandScaleMode.clear();
+    lastCommandFullscreen = false;
+}
+
+std::string Overlay::generateCommandString(const DisplaySettings& settings) {
+    std::string cmd = "./build/consoleVideoPlayer " + settings.videoFilePath;
+
+    if (settings.syncOffsetMs != 0.0) {
+        char offsetBuf[32];
+        snprintf(offsetBuf, sizeof(offsetBuf), " --offset %.1f", settings.syncOffsetMs);
+        cmd += offsetBuf;
+    }
+
+    if (settings.fullscreen) {
+        cmd += " --fullscreen";
+    }
+
+    if (settings.scaleMode != "letterbox") {
+        cmd += " --scale " + settings.scaleMode;
+    }
+
+    return cmd;
 }
 
 void Overlay::toggle() {
@@ -73,7 +111,7 @@ GLuint Overlay::renderTextToTexture(const std::string& text, SDL_Color color, in
     return texture;
 }
 
-void Overlay::render(VideoPlayer& player, int droppedFrames) {
+void Overlay::render(VideoPlayer& player, const VideoInfo& videoInfo, const DisplaySettings& displaySettings) {
     if (!enabled || !font) return;
 
     glDisable(GL_TEXTURE_2D);
@@ -85,6 +123,7 @@ void Overlay::render(VideoPlayer& player, int droppedFrames) {
     float bufferPercent = bufferedCount / 150.0f;
 
     SDL_Color white = {255, 255, 255, 255};
+    SDL_Color cyan = {0, 255, 255, 255};
 
     // "Buffer:" label (cached - only generate once)
     if (!bufferLabelTex) {
@@ -158,39 +197,102 @@ void Overlay::render(VideoPlayer& player, int droppedFrames) {
         glDisable(GL_TEXTURE_2D);
     }
 
-    // Dropped frames counter (only regenerate when count changes)
-    if (droppedFrames != lastRenderedDroppedFrames) {
-        if (droppedFramesTextTex) {
-            glDeleteTextures(1, &droppedFramesTextTex);
-        }
-
-        char droppedText[128];
-        snprintf(droppedText, sizeof(droppedText), "Dropped: %d", droppedFrames);
-
-        // Color based on severity
-        SDL_Color color;
-        if (droppedFrames == 0) {
-            color = {0, 255, 0, 255};  // Green
-        } else if (droppedFrames < 10) {
-            color = {255, 255, 0, 255};  // Yellow
-        } else {
-            color = {255, 0, 0, 255};  // Red
-        }
-
-        droppedFramesTextTex = renderTextToTexture(droppedText, color, droppedFramesTextW, droppedFramesTextH);
-        lastRenderedDroppedFrames = droppedFrames;
+    // Video info (static - only generate once)
+    if (!videoInfoTex) {
+        char infoText[256];
+        snprintf(infoText, sizeof(infoText), "%dx%d @ %.2f fps | %.1fs | %s",
+                 videoInfo.width, videoInfo.height, videoInfo.fps,
+                 videoInfo.duration, videoInfo.codecName.c_str());
+        videoInfoTex = renderTextToTexture(infoText, cyan, videoInfoW, videoInfoH);
     }
-
-    if (droppedFramesTextTex) {
+    if (videoInfoTex) {
         glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, droppedFramesTextTex);
+        glBindTexture(GL_TEXTURE_2D, videoInfoTex);
         glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         glBegin(GL_QUADS);
         glTexCoord2f(0, 0); glVertex2f(10, 95);
-        glTexCoord2f(1, 0); glVertex2f(10 + droppedFramesTextW, 95);
-        glTexCoord2f(1, 1); glVertex2f(10 + droppedFramesTextW, 95 + droppedFramesTextH);
-        glTexCoord2f(0, 1); glVertex2f(10, 95 + droppedFramesTextH);
+        glTexCoord2f(1, 0); glVertex2f(10 + videoInfoW, 95);
+        glTexCoord2f(1, 1); glVertex2f(10 + videoInfoW, 95 + videoInfoH);
+        glTexCoord2f(0, 1); glVertex2f(10, 95 + videoInfoH);
         glEnd();
+        glDisable(GL_TEXTURE_2D);
+    }
+
+    // Settings (regenerate when any setting changes)
+    if (!settingsTex || displaySettings.syncOffsetMs != lastRenderedOffset ||
+        displaySettings.scaleMode != lastScaleMode || displaySettings.fullscreen != lastFullscreen) {
+        if (settingsTex) {
+            glDeleteTextures(1, &settingsTex);
+        }
+
+        char settingsText[256];
+        snprintf(settingsText, sizeof(settingsText), "Offset: %.1fms | %s | %s",
+                 displaySettings.syncOffsetMs,
+                 displaySettings.scaleMode.c_str(),
+                 displaySettings.fullscreen ? "fullscreen" : "windowed");
+        settingsTex = renderTextToTexture(settingsText, white, settingsW, settingsH);
+        lastRenderedOffset = displaySettings.syncOffsetMs;
+        lastScaleMode = displaySettings.scaleMode;
+        lastFullscreen = displaySettings.fullscreen;
+    }
+    if (settingsTex) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, settingsTex);
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(10, 125);
+        glTexCoord2f(1, 0); glVertex2f(10 + settingsW, 125);
+        glTexCoord2f(1, 1); glVertex2f(10 + settingsW, 125 + settingsH);
+        glTexCoord2f(0, 1); glVertex2f(10, 125 + settingsH);
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
+    }
+
+    // Command to reproduce current state (regenerate when settings change)
+    if (!commandTex || displaySettings.syncOffsetMs != lastCommandOffset ||
+        displaySettings.scaleMode != lastCommandScaleMode || displaySettings.fullscreen != lastCommandFullscreen) {
+        if (commandTex) {
+            glDeleteTextures(1, &commandTex);
+        }
+
+        std::string cmdStr = generateCommandString(displaySettings);
+        SDL_Color green = {0, 255, 0, 255};
+        commandTex = renderTextToTexture(cmdStr, green, commandW, commandH);
+        lastCommandOffset = displaySettings.syncOffsetMs;
+        lastCommandScaleMode = displaySettings.scaleMode;
+        lastCommandFullscreen = displaySettings.fullscreen;
+    }
+    if (commandTex) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, commandTex);
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(10, 155);
+        glTexCoord2f(1, 0); glVertex2f(10 + commandW, 155);
+        glTexCoord2f(1, 1); glVertex2f(10 + commandW, 155 + commandH);
+        glTexCoord2f(0, 1); glVertex2f(10, 155 + commandH);
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
+    }
+
+    // Keyboard help (always on)
+    if (!helpTex) {
+        std::string helpText =
+            "I:Overlay  F:Fullscreen  S:Scale  Arrows:Offset  0:Reset  Q:Quit";
+        SDL_Color yellow = {255, 255, 0, 255};
+        helpTex = renderTextToTexture(helpText, yellow, helpW, helpH);
+    }
+    if (helpTex) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, helpTex);
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(10, 185);
+        glTexCoord2f(1, 0); glVertex2f(10 + helpW, 185);
+        glTexCoord2f(1, 1); glVertex2f(10 + helpW, 185 + helpH);
+        glTexCoord2f(0, 1); glVertex2f(10, 185 + helpH);
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
     }
 
     glDisable(GL_BLEND);

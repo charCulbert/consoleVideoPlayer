@@ -16,6 +16,7 @@
 #include "VideoPlayer.h"
 #include "JackTransportClient.h"
 #include "Overlay.h"
+#include "KeyboardController.h"
 
 // PBOs removed - they add 1-frame latency. Direct texture upload is fast enough.
 
@@ -40,13 +41,6 @@ void signal_handler(int sig) {
     std::cout.flush(); \
 } while(0)
 
-struct Settings {
-    std::string videoFilePath;
-    double syncOffsetMs = 0.0;
-    bool fullscreen = false;
-    std::string scaleMode = "letterbox";  // Options: "letterbox", "stretch", "crop"
-};
-
 void showHelp(const char* programName) {
     std::cout << "Usage: " << programName << " <video_file> [options]\n\n";
     std::cout << "Options:\n";
@@ -66,8 +60,8 @@ void showHelp(const char* programName) {
     std::cout << "  " << programName << " video.mp4 -o -10.5 -f -s stretch\n";
 }
 
-Settings parseCommandLine(int argc, char* argv[]) {
-    Settings settings;
+AppSettings parseCommandLine(int argc, char* argv[]) {
+    AppSettings settings;
 
     // Check for help first
     for (int i = 1; i < argc; i++) {
@@ -215,13 +209,13 @@ int main(int argc, char* argv[]) {
         std::cerr << "Warning: Could not load font, overlay disabled" << std::endl;
     }
 
+    // Initialize keyboard controller
+    KeyboardController keyboard(settings, overlay, window);
+
     // PBOs removed for lower latency (direct upload is fast enough for HD video)
 
     // Enable vsync
     SDL_GL_SetSwapInterval(1);
-
-    // Dropped frames counter (only when decoder fails to provide requested frame)
-    int droppedFrames = 0;
 
     // Get actual window size
     SDL_GetWindowSize(window, &windowWidth, &windowHeight);
@@ -284,7 +278,23 @@ int main(int argc, char* argv[]) {
                   << (settings.syncOffsetMs > 0 ? "(video delayed)" : "(video advanced)") << std::endl;
     }
 
-    std::cout << "\nReady. Waiting for JACK Transport... (ESC or Q to quit)\n" << std::endl;
+    std::cout << "\nReady. Waiting for JACK Transport..." << std::endl;
+    std::cout << "Press H for keyboard controls, I for overlay, ESC/Q to quit\n" << std::endl;
+
+    // Prepare video info for overlay
+    VideoInfo videoInfo;
+    videoInfo.width = videoPlayer.getWidth();
+    videoInfo.height = videoPlayer.getHeight();
+    videoInfo.fps = videoPlayer.getFPS();
+    videoInfo.duration = videoPlayer.getDuration();
+    videoInfo.codecName = videoPlayer.getCodecName();
+
+    // Prepare display settings for overlay
+    DisplaySettings displaySettings;
+    displaySettings.syncOffsetMs = settings.syncOffsetMs;
+    displaySettings.fullscreen = settings.fullscreen;
+    displaySettings.scaleMode = settings.scaleMode;
+    displaySettings.videoFilePath = settings.videoFilePath;
 
     // Main render loop
     bool running = true;
@@ -293,17 +303,33 @@ int main(int argc, char* argv[]) {
     while (running) {
         // Handle events
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
+            if (!keyboard.handleEvent(event)) {
                 running = false;
-            } else if (event.type == SDL_KEYDOWN) {
-                if (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
-                    running = false;
-                } else if (event.key.keysym.sym == SDLK_i) {
-                    overlay.toggle();
-                    std::cout << "Overlay " << (overlay.isEnabled() ? "ON" : "OFF") << std::endl;
-                }
             }
         }
+
+        // Handle fullscreen toggle
+        if (keyboard.needsFullscreenToggle()) {
+            if (settings.fullscreen) {
+                SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            } else {
+                SDL_SetWindowFullscreen(window, 0);
+            }
+            // Update window dimensions after fullscreen toggle
+            SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+            glViewport(0, 0, windowWidth, windowHeight);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrtho(0, windowWidth, windowHeight, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+            keyboard.clearFullscreenToggle();
+        }
+
+        // Update display settings (may have changed via keyboard)
+        displaySettings.syncOffsetMs = keyboard.getSyncOffsetMs();
+        displaySettings.fullscreen = settings.fullscreen;
+        displaySettings.scaleMode = settings.scaleMode;
 
         // Simple deterministic logic:
         // 1. Get time from JACK
@@ -330,7 +356,7 @@ int main(int argc, char* argv[]) {
         if (clampedJackTime > duration) clampedJackTime = duration;
 
         // Step 2: Apply offset
-        double offsetSec = settings.syncOffsetMs / 1000.0;
+        double offsetSec = displaySettings.syncOffsetMs / 1000.0;
         double videoTime = clampedJackTime - offsetSec;  // positive offset = delay video, negative = advance
 
         // Step 3: Wrap ONLY if offset made it negative (wraps to end of video)
@@ -353,11 +379,6 @@ int main(int argc, char* argv[]) {
 
         // Step 4: Get frame from cache (getCurrentFrame handles holding last valid frame)
         const VideoFrame* frame = videoPlayer.getCurrentFrame();
-
-        // Count dropped frames only when decoder fails to provide the requested frame
-        if (!frame) {
-            droppedFrames++;
-        }
 
         // Upload directly to GPU (no PBO delay)
         if (frame) {
@@ -418,7 +439,7 @@ int main(int argc, char* argv[]) {
             glEnd();
 
             // Draw overlay
-            overlay.render(videoPlayer, droppedFrames);
+            overlay.render(videoPlayer, videoInfo, displaySettings);
         }
 
         // Swap buffers

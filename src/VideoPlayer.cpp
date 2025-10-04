@@ -108,11 +108,17 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
     // Try hardware decoder
     if (hwDecoderName) {
         codec = avcodec_find_decoder_by_name(hwDecoderName);
+        if (codec) {
+            std::cout << "Attempting hardware decoder: " << hwDecoderName << std::endl;
+        }
     }
 
     // Fallback to software decoder
     if (!codec) {
         codec = avcodec_find_decoder(codecParams->codec_id);
+        if (codec) {
+            std::cout << "Using software decoder: " << codec->name << std::endl;
+        }
     }
 
     if (!codec) {
@@ -120,6 +126,8 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
         closeFFmpegContexts();
         return false;
     }
+
+    codecName = codec->name;
 
     codecContext = avcodec_alloc_context3(codec);
     if (!codecContext) {
@@ -162,10 +170,15 @@ bool VideoPlayer::loadVideo(const std::string& filePath) {
                 closeFFmpegContexts();
                 return false;
             }
+            std::cout << "✓ Software decoder active: " << codec->name << std::endl;
         } else {
             errorMessage = "Failed to open codec";
             closeFFmpegContexts();
             return false;
+        }
+    } else {
+        if (hwDecoderName) {
+            std::cout << "✓ Hardware decoder active: " << hwDecoderName << std::endl;
         }
     }
 

@@ -10,6 +10,7 @@ add_executable(consoleVideoPlayer
     src/VideoPlayer.cpp
     src/JackTransportClient.cpp
     src/Overlay.cpp
+    src/KeyboardController.cpp
 )
 
 # Common packages for both platforms

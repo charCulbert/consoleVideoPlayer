@@ -60,6 +60,7 @@ public:
     int getHeight() const { return height; }
     double getDuration() const { return duration; }
     int getCurrentFrameIndex() const { return currentFrameIndex.load(std::memory_order_relaxed); }
+    std::string getCodecName() const { return codecName; }
 
 private:
     bool loaded = false;
@@ -72,6 +73,7 @@ private:
     double fps = 0.0;
     double duration = 0.0;
     int totalFrames = 0;
+    std::string codecName;
 
     // Playback state
     std::atomic<int> currentFrameIndex{0};
