@@ -9,4 +9,5 @@ cmake-build-*/
 *.user
 *.swp
 *.swo
-*~
+*~.cache/
+.cache/
